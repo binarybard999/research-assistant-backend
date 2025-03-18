@@ -1,0 +1,21 @@
+backend/
+├── config/
+│   ├── config.js         // Contains environment configuration (e.g., GEMINI_API_KEY)
+│   └── db.js             // MongoDB connection setup
+├── controllers/
+│   └── paperController.js // Handles paper uploads, text extraction, Gemini API calls, and KB creation
+├── middleware/
+│   ├── authMiddleware.js  // JWT-based authentication
+│   └── errorHandler.js    // Global error handling
+├── models/
+│   ├── User.js            // User schema and model
+│   ├── Paper.js           // Paper schema (includes metadata, full text, summary, keywords, etc.)
+│   └── KnowledgeBase.js   // Schema for the aggregated knowledge base from uploaded papers
+├── routes/
+│   └── paperRoutes.js     // Routes for paper upload and retrieval (secured)
+├── services/
+│   └── geminiService.js   // Service for calling the Gemini API with a given prompt
+├── uploads/               // (Optional) For temporary storage of uploaded files (if needed)
+├── .env                   // Environment variables (MONGO_URI, JWT_SECRET, GEMINI_API_KEY, PORT, etc.)
+├── package.json           // Ensure "type": "module" is set for ES modules
+└── server.js              // Main Express server entry point
