@@ -3,6 +3,7 @@ import fs from "fs";
 import path from "path";
 import Paper from "../models/paper.model.js";
 import KnowledgeBase from "../models/knowledgeBase.model.js";
+import ChatMessage from "../models/chatMessage.model.js";
 import geminiService from "../services/gemini.service.js";
 import asyncHandler from "../utils/asyncHandler.js";
 
@@ -14,10 +15,10 @@ async function extractTextFromPDF(buffer) {
 function normalizeText(text) {
     // Remove extra spaces, newlines, and tabs
     return text
-        .replace(/\s+/g, ' ')     // Replace multiple whitespace characters with a single space
-        .replace(/\n+/g, ' ')     // Replace newlines with spaces
-        .replace(/\t+/g, ' ')     // Replace tabs with spaces
-        .trim();                  // Remove leading and trailing whitespace
+        .replace(/\s+/g, " ") // Replace multiple whitespace characters with a single space
+        .replace(/\n+/g, " ") // Replace newlines with spaces
+        .replace(/\t+/g, " ") // Replace tabs with spaces
+        .trim(); // Remove leading and trailing whitespace
 }
 
 // Function to remove file from filesystem
@@ -54,10 +55,14 @@ export const uploadPaper = asyncHandler(async (req, res, next) => {
         // Store the original text for debugging/comparison if needed
         const originalLength = rawExtractedText.length;
         const normalizedLength = extractedText.length;
-        console.log(`Original text length: ${originalLength}, Normalized text length: ${normalizedLength}`);
-        console.log(`Space reduction: ${(originalLength - normalizedLength) / originalLength * 100}%`);
+        console.log(
+            `Original text length: ${originalLength}, Normalized text length: ${normalizedLength}`
+        );
+        console.log(
+            `Space reduction: ${((originalLength - normalizedLength) / originalLength) * 100}%`
+        );
 
-        // Define chunk size (e.g., 3000 characters per chunk)
+        // Define chunk size (e.g., 5000 characters per chunk)
         const chunkSize = 5000;
         const chunks = [];
         for (let i = 0; i < extractedText.length; i += chunkSize) {
@@ -93,10 +98,15 @@ export const uploadPaper = asyncHandler(async (req, res, next) => {
                 }
 
                 if (Array.isArray(analysis.keywords)) {
-                    analysis.keywords.forEach((kw) => aggregatedKeywords.add(kw.trim()));
+                    analysis.keywords.forEach((kw) =>
+                        aggregatedKeywords.add(kw.trim())
+                    );
                 }
             } catch (chunkError) {
-                console.error(`Error processing chunk ${chunkCount}:`, chunkError);
+                console.error(
+                    `Error processing chunk ${chunkCount}:`,
+                    chunkError
+                );
                 // Continue with next chunk instead of failing the entire process
             }
         }
@@ -138,8 +148,8 @@ export const uploadPaper = asyncHandler(async (req, res, next) => {
                 keywords: paper.keywords.slice(0, 10), // Return just first 10 keywords for response
                 originalTextLength: originalLength,
                 normalizedTextLength: normalizedLength,
-                chunksProcessed: totalChunks
-            }
+                chunksProcessed: totalChunks,
+            },
         });
     } catch (err) {
         console.error("Error in uploadPaper:", err);
@@ -168,6 +178,45 @@ export const getPaperById = asyncHandler(async (req, res, next) => {
         if (!paper) return res.status(404).json({ message: "Paper not found" });
         res.json(paper);
     } catch (err) {
+        next(err);
+    }
+});
+
+export const deletePaper = asyncHandler(async (req, res, next) => {
+    const { id } = req.params;
+    const userId = req.user.id;
+
+    // Add validation for ID
+    if (!id || id === "undefined") {
+        return res.status(400).json({ message: "Invalid or missing paper ID" });
+    }
+
+    try {
+        // Find the paper
+        const paper = await Paper.findById(id);
+        if (!paper) {
+            return res.status(404).json({ message: "Paper not found" });
+        }
+
+        // Check if the user has permission to delete this paper
+        if (paper.user.toString() !== userId) {
+            return res.status(403).json({
+                message: "You don't have permission to delete this paper",
+            });
+        }
+
+        // Delete associated chat messages
+        await ChatMessage.deleteMany({ paper: id });
+
+        // Delete associated knowledge base
+        await KnowledgeBase.deleteOne({ paper: id });
+
+        // Delete the paper itself
+        await Paper.findByIdAndDelete(id);
+
+        res.json({ message: "Paper and associated data deleted successfully" });
+    } catch (err) {
+        console.error("Error deleting paper:", err);
         next(err);
     }
 });
