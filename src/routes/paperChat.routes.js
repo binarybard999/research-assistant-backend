@@ -3,6 +3,7 @@ import {
     processChatMessage,
     getChatHistory,
     addSystemMessage,
+    getPaperDetails,
 } from "../controllers/paperChat.controller.js";
 import { authMiddleware } from "../middlewares/auth.middleware.js";
 
@@ -16,7 +17,10 @@ router.post("/:paperId/chat", processChatMessage);
 // Get chat history for a paper
 router.get("/:paperId/chat/history", getChatHistory);
 
-// Add the new route for system messages
+// Add route for paper details
+router.get("/:paperId/details", getPaperDetails);
+
+// Add the route for system messages
 router.post("/:paperId/system", addSystemMessage);
 
 export default router;

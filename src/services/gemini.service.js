@@ -7,7 +7,7 @@ const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash" });
 
 const generationConfig = {
-    temperature: 0.7, // Slightly lower temperature for more structured output
+    temperature: 0.7,
     topP: 0.95,
     topK: 40,
     maxOutputTokens: 8192,
@@ -24,7 +24,7 @@ export const analyzePaper = async (paperChunk) => {
         // Create a structured prompt that explicitly requests JSON format
         const structuredPrompt = `
 You are a research paper analysis AI. Analyze the following research paper content and provide a response in valid JSON format with exactly these fields:
-- "keywords": An array of important keywords or concepts (5-10 items)
+- "keywords": An array of important keywords or concepts (8-10 items)
 - "summary": A concise summary (2-3 paragraphs)
 - "explanation": A detailed explanation of the main concepts (3-5 paragraphs)
 
@@ -98,4 +98,44 @@ export const generateResponse = async (prompt) => {
     }
 };
 
-export default { analyzePaper, generateResponse };
+/**
+ * Generate a response to a chat conversation using the Gemini AI model.
+ * @param {Array} messages - Array of message objects with role and content
+ * @returns {Promise<string>} - The AI-generated response text.
+ */
+export const generateChatResponse = async (messages) => {
+    try {
+        // Convert messages to Gemini's expected format
+        const formattedMessages = messages.map((msg) => ({
+            role: msg.role === "assistant" ? "model" : msg.role,
+            parts: [{ text: msg.content }],
+        }));
+
+        // Create a chat session
+        const chat = model.startChat({
+            generationConfig,
+            history: formattedMessages.slice(0, -1), // Add all but the last message to history
+        });
+
+        // Send the last message to get a response
+        const lastMessage = formattedMessages[formattedMessages.length - 1];
+        const result = await chat.sendMessage(lastMessage.parts[0].text);
+
+        // Return the text response
+        return result.response.text();
+    } catch (err) {
+        console.error("Gemini API Error in chat response:", err);
+        // If there's an issue with chat history, fall back to single message approach
+        try {
+            console.log("Falling back to single message approach");
+            // Get just the last message
+            const lastMessage = messages[messages.length - 1];
+            return await generateResponse(lastMessage.content);
+        } catch (fallbackErr) {
+            console.error("Fallback also failed:", fallbackErr);
+            throw new Error("Gemini API Error: " + err.message);
+        }
+    }
+};
+
+export default { analyzePaper, generateResponse, generateChatResponse };
