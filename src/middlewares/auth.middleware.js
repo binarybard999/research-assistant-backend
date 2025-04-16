@@ -5,15 +5,22 @@ import User from "../models/user.model.js";
 
 export const authMiddleware = asyncHandler(async (req, _, next) => {
     try {
-        const token =
-            req.cookies?.accessToken ||
-            req.header("Authorization")?.replace("Bearer ", "");
+        // const token =
+        //     req.cookies?.accessToken ||
+        //     req.header("Authorization")?.replace("Bearer ", "");
+        
+        const token = req.cookies?.accessToken;
+        let decodedToken;
 
         if (!token) {
-            throw new ApiError(401, "Unauthorized request");
+            const bearerToken = req
+                .header("Authorization")
+                ?.replace("Bearer ", "");
+            if (!bearerToken) throw new ApiError(401, "Unauthorized request");
+            decodedToken = jwt.verify(bearerToken, process.env.JWT_SECRET);
+        } else {
+            decodedToken = jwt.verify(token, process.env.JWT_SECRET);
         }
-
-        const decodedToken = jwt.verify(token, process.env.JWT_SECRET);
 
         const user = await User.findById(decodedToken.user.id).select(
             "-password -refreshToken"

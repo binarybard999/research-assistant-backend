@@ -4,23 +4,25 @@ import {
     getChatHistory,
     addSystemMessage,
     getPaperDetails,
+    chatUploadPaper,
 } from "../controllers/paperChat.controller.js";
 import { authMiddleware } from "../middlewares/auth.middleware.js";
+import { chatUpload } from "../middlewares/multer.middleware.js";
+import { checkChatUploadLimit } from "../middlewares/rateLimit.middleware.js";
 
 const router = express.Router();
 
 router.use(authMiddleware);
 
-// Process a chat message and get a response
 router.post("/:paperId/chat", processChatMessage);
-
-// Get chat history for a paper
 router.get("/:paperId/chat/history", getChatHistory);
-
-// Add route for paper details
 router.get("/:paperId/details", getPaperDetails);
-
-// Add the route for system messages
 router.post("/:paperId/system", addSystemMessage);
+router.post(
+    "/:chatId/upload",
+    chatUpload.single("paper"),
+    checkChatUploadLimit,
+    chatUploadPaper
+);
 
 export default router;

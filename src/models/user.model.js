@@ -4,21 +4,22 @@ import bcrypt from "bcryptjs";
 
 const UserSchema = new mongoose.Schema(
     {
-        name: {
+        name: { type: String, required: true },
+        email: { type: String, required: true, unique: true },
+        password: { type: String, required: true },
+        refreshToken: { type: String },
+        tier: {
             type: String,
-            required: true,
+            enum: ["free", "pro", "enterprise"],
+            default: "free",
         },
-        email: {
-            type: String,
-            required: true,
-            unique: true,
+        uploadLimits: {
+            concurrentPapers: { type: Number, default: 3 },
+            monthlyUploads: { type: Number, default: 10 },
         },
-        password: {
-            type: String,
-            required: true,
-        },
-        refreshToken: {
-            type: String,
+        usage: {
+            currentMonthUploads: { type: Number, default: 0 },
+            totalChats: { type: Number, default: 0 },
         },
     },
     { timestamps: true }
@@ -27,7 +28,6 @@ const UserSchema = new mongoose.Schema(
 // Hash password before saving
 UserSchema.pre("save", async function (next) {
     if (!this.isModified("password")) return next();
-
     const salt = await bcrypt.genSalt(10);
     this.password = await bcrypt.hash(this.password, salt);
     next();
@@ -56,11 +56,7 @@ UserSchema.methods.generateAccessToken = function () {
 // Method to generate refresh token
 UserSchema.methods.generateRefreshToken = function () {
     return jwt.sign(
-        {
-            user: {
-                id: this._id,
-            },
-        },
+        { user: { id: this._id } },
         process.env.REFRESH_TOKEN_SECRET,
         { expiresIn: process.env.REFRESH_TOKEN_EXPIRY || "7d" }
     );

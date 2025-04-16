@@ -18,8 +18,17 @@ const ChatMessageSchema = new mongoose.Schema(
         },
         role: {
             type: String,
-            enum: ["user", "assistant", "system"],
+            enum: ["user", "assistant", "system", "tool"],
             required: true,
+        },
+        functionCall: {
+            name: String,
+            arguments: mongoose.Schema.Types.Mixed,
+            response: mongoose.Schema.Types.Mixed,
+        },
+        metadata: {
+            citationRefs: [String],
+            chunkRefs: [String], // For tracking which chunks were used
         },
     },
     { timestamps: true }

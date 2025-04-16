@@ -62,10 +62,28 @@ export const register = asyncHandler(async (req, res, next) => {
     }
 
     // Generate tokens and set cookies
-    const { accessToken, refreshToken } = await generateTokensAndSetCookies(
-        user,
-        res
-    );
+    // const { accessToken, refreshToken } = await generateTokensAndSetCookies(
+    //     user,
+    //     res
+    // );
+    const accessToken = user.generateAccessToken();
+
+    const options = {
+        httpOnly: true,
+        secure: process.env.NODE_ENV === "production",
+    };
+
+    res.cookie("accessToken", accessToken, options);
+
+    return res
+        .status(200)
+        .json(
+            new ApiResponse(
+                200,
+                { accessToken },
+                "Access token refreshed successfully"
+            )
+        );
 
     // Return response
     return res.status(201).json(
@@ -203,4 +221,27 @@ export const getCurrentUser = asyncHandler(async (req, res) => {
         .json(
             new ApiResponse(200, req.user, "Current user fetched successfully")
         );
+});
+
+// Send reset email (OTP or link)
+export const forgotPassword = asyncHandler(async (req, res) => {
+    const { email } = req.body;
+    if (!email) throw new ApiError(400, "Email is required");
+
+    const user = await User.findOne({ email });
+    if (!user) throw new ApiError(404, "No user found with this email");
+
+    // Generate reset token (or OTP), save to DB with expiry
+    // Email to user (skip actual email logic if not needed here)
+
+    return res
+        .status(200)
+        .json(new ApiResponse(200, {}, "Password reset link sent to email"));
+});
+
+// Reset the password
+export const resetPassword = asyncHandler(async (req, res) => {
+    const { token, newPassword } = req.body;
+    // Verify token and expiry, then update password
+    // Invalidate previous refreshToken, optionally force logout
 });

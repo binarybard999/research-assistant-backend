@@ -1,6 +1,12 @@
 const errorHandler = (err, req, res, next) => {
-    console.error(err.stack);
-    res.status(500).json({ message: "Server Error", error: err.message });
-};
+    const statusCode = err.statusCode || 500;
+    const message = err.message || "Internal Server Error";
 
-export default errorHandler;
+    console.error(err.stack);
+
+    res.status(statusCode).json({
+        success: false,
+        message,
+        ...(process.env.NODE_ENV !== "production" && { stack: err.stack }),
+    });
+};

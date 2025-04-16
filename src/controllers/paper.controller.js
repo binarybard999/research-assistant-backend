@@ -1,222 +1,386 @@
 import pdfParse from "pdf-parse";
-import fs from "fs";
+import fs from "fs/promises";
 import path from "path";
 import Paper from "../models/paper.model.js";
+import User from "../models/user.model.js";
 import KnowledgeBase from "../models/knowledgeBase.model.js";
+import asyncHandler from "../utils/asyncHandler.js";
+import { ApiError } from "../utils/ApiError.js";
 import ChatMessage from "../models/chatMessage.model.js";
 import geminiService from "../services/gemini.service.js";
-import asyncHandler from "../utils/asyncHandler.js";
 
-async function extractTextFromPDF(buffer) {
-    const data = await pdfParse(buffer);
-    return data.text; // Extracted text from PDF
-}
+const normalizeText = (text) => text.replace(/\s+/g, " ").trim();
 
-function normalizeText(text) {
-    // Remove extra spaces, newlines, and tabs
-    return text
-        .replace(/\s+/g, " ") // Replace multiple whitespace characters with a single space
-        .replace(/\n+/g, " ") // Replace newlines with spaces
-        .replace(/\t+/g, " ") // Replace tabs with spaces
-        .trim(); // Remove leading and trailing whitespace
-}
-
-// Function to remove file from filesystem
-function removeFile(filePath) {
+export async function extractTextFromPDF(buffer) {
     try {
-        if (filePath && fs.existsSync(filePath)) {
-            fs.unlinkSync(filePath);
-            console.log(`File removed: ${filePath}`);
+        const data = await pdfParse(buffer);
+        const extracted = normalizeText(data.text);
+
+        if (!extracted || extracted.length < 20) {
+            // Could be image-only or blank PDF
+            console.warn("⚠️ PDF appears to contain no extractable text.");
+            throw new ApiError(400, "PDF contains no readable text");
         }
+
+        return extracted;
     } catch (err) {
-        console.error(`Error removing file ${filePath}:`, err);
+        console.error("❌ PDF parsing failed:", err.message);
+        throw new ApiError(400, "Invalid or unreadable PDF file");
     }
 }
 
-export const uploadPaper = asyncHandler(async (req, res, next) => {
-    // Store the file path if it exists
-    const filePath = req.file?.path || null;
+async function removeFile(filePath) {
+    if (!filePath) {
+        console.warn("No file path provided to removeFile");
+        return;
+    }
 
     try {
-        const { title, authors, abstract } = req.body;
-        if (!req.file) {
-            return res.status(400).json({ message: "No file uploaded" });
-        }
-
-        // Use buffer if available, otherwise fallback to file path
-        const dataBuffer = req.file.buffer || fs.readFileSync(filePath);
-
-        // Extract text from the PDF using pdf-parse
-        const rawExtractedText = await extractTextFromPDF(dataBuffer);
-
-        // Normalize the text by removing extra spaces
-        const extractedText = normalizeText(rawExtractedText);
-
-        // Store the original text for debugging/comparison if needed
-        const originalLength = rawExtractedText.length;
-        const normalizedLength = extractedText.length;
-        console.log(
-            `Original text length: ${originalLength}, Normalized text length: ${normalizedLength}`
-        );
-        console.log(
-            `Space reduction: ${((originalLength - normalizedLength) / originalLength) * 100}%`
-        );
-
-        // Define chunk size (e.g., 5000 characters per chunk)
-        const chunkSize = 5000;
-        const chunks = [];
-        for (let i = 0; i < extractedText.length; i += chunkSize) {
-            chunks.push(extractedText.substring(i, i + chunkSize));
-        }
-
-        console.log(`Total chunks after normalization: ${chunks.length}`);
-
-        // Initialize aggregators for the Knowledge Base
-        let aggregatedSummary = "";
-        let aggregatedKeywords = new Set();
-        let aggregatedExplanations = "";
-
-        // Process each chunk with the Gemini API
-        let chunkCount = 0;
-        const totalChunks = chunks.length;
-
-        for (const chunk of chunks) {
-            chunkCount++;
-            console.log(`Processing chunk ${chunkCount}/${totalChunks}`);
-
+        await fs.unlink(filePath);
+        console.log(`✅ File deleted: ${filePath}`);
+    } catch (err) {
+        if (err.code === "EBUSY" || err.code === "EPERM") {
+            console.warn(`⚠️ File is busy, retrying delete in 1s: ${filePath}`);
+            await new Promise((resolve) => setTimeout(resolve, 1000));
             try {
-                // Send just the paper chunk - the prompt formatting is handled inside the service
-                const analysis = await geminiService.analyzePaper(chunk);
-
-                // Now we can safely access properties since analysis should be a JSON object
-                if (analysis.summary) {
-                    aggregatedSummary += analysis.summary + "\n\n";
-                }
-
-                if (analysis.explanation) {
-                    aggregatedExplanations += analysis.explanation + "\n\n";
-                }
-
-                if (Array.isArray(analysis.keywords)) {
-                    analysis.keywords.forEach((kw) =>
-                        aggregatedKeywords.add(kw.trim())
-                    );
-                }
-            } catch (chunkError) {
+                await fs.unlink(filePath);
+                console.log(`✅ File deleted after retry: ${filePath}`);
+            } catch (retryErr) {
                 console.error(
-                    `Error processing chunk ${chunkCount}:`,
-                    chunkError
+                    `❌ Retry failed to delete file: ${filePath}`,
+                    retryErr
                 );
-                // Continue with next chunk instead of failing the entire process
             }
+        } else if (err.code === "ENOENT") {
+            console.warn(`⚠️ File already deleted or not found: ${filePath}`);
+        } else {
+            console.error(`❌ File cleanup error: ${filePath}`, err);
         }
-
-        // Convert aggregated keywords from Set to Array
-        const keywordsArray = Array.from(aggregatedKeywords);
-
-        // Create and save a new Paper document
-        const paper = new Paper({
-            title,
-            authors,
-            abstract,
-            content: extractedText, // Save the normalized text
-            summary: aggregatedSummary.trim(),
-            keywords: keywordsArray,
-            user: req.user.id,
-        });
-        await paper.save();
-
-        // Create and save the Knowledge Base entry
-        const knowledge = new KnowledgeBase({
-            paper: paper._id,
-            aggregatedSummary: aggregatedSummary.trim(),
-            aggregatedKeywords: keywordsArray,
-            aggregatedExplanations: aggregatedExplanations.trim(),
-        });
-        await knowledge.save();
-
-        // Remove the file after successful processing
-        if (filePath) {
-            removeFile(filePath);
-        }
-
-        res.status(201).json({
-            success: true,
-            paper: {
-                id: paper._id,
-                title: paper.title,
-                keywords: paper.keywords.slice(0, 10), // Return just first 10 keywords for response
-                originalTextLength: originalLength,
-                normalizedTextLength: normalizedLength,
-                chunksProcessed: totalChunks,
-            },
-        });
-    } catch (err) {
-        console.error("Error in uploadPaper:", err);
-
-        // Remove the file if there was an error
-        if (filePath) {
-            removeFile(filePath);
-        }
-
-        next(err);
     }
-});
+}
 
-export const getPapers = asyncHandler(async (req, res, next) => {
+export const uploadPapers = asyncHandler(async (req, res) => {
     try {
-        const papers = await Paper.find({ user: req.user.id });
-        res.json(papers);
-    } catch (err) {
-        next(err);
-    }
-});
+        const user = await User.findById(req.user?._id);
 
-export const getPaperById = asyncHandler(async (req, res, next) => {
-    try {
-        const paper = await Paper.findById(req.params.id);
-        if (!paper) return res.status(404).json({ message: "Paper not found" });
-        res.json(paper);
-    } catch (err) {
-        next(err);
-    }
-});
-
-export const deletePaper = asyncHandler(async (req, res, next) => {
-    const { id } = req.params;
-    const userId = req.user.id;
-
-    // Add validation for ID
-    if (!id || id === "undefined") {
-        return res.status(400).json({ message: "Invalid or missing paper ID" });
-    }
-
-    try {
-        // Find the paper
-        const paper = await Paper.findById(id);
-        if (!paper) {
-            return res.status(404).json({ message: "Paper not found" });
+        if (!user) {
+            console.error("Authenticated user not found in database");
+            throw new ApiError(401, "User not found");
         }
 
-        // Check if the user has permission to delete this paper
-        if (paper.user.toString() !== userId) {
-            return res.status(403).json({
-                message: "You don't have permission to delete this paper",
+        const files = req.files;
+        console.log("Received files:", files);
+        console.log("User ID:", user._id);
+
+        if (!files || files.length === 0) {
+            console.warn("No files uploaded");
+            throw new ApiError(400, "No files uploaded");
+        }
+
+        console.log(`Received ${files.length} files from user ${user._id}`);
+
+        // Tier validation
+        const remainingUploads =
+            user.uploadLimits.monthlyUploads - user.usage.currentMonthUploads;
+
+        const maxAllowed = Math.min(
+            remainingUploads,
+            user.uploadLimits.concurrentPapers
+        );
+
+        if (files.length > maxAllowed) {
+            const excessFiles = files.slice(maxAllowed);
+            await Promise.all(excessFiles.map((f) => removeFile(f.path)));
+
+            console.warn(
+                `Upload limit exceeded. Allowed: ${maxAllowed}, Uploaded: ${files.length}`
+            );
+
+            throw new ApiError(413, {
+                message: `Exceeded ${user.tier} tier limit`,
+                limits: {
+                    monthly: user.uploadLimits.monthlyUploads,
+                    concurrent: user.uploadLimits.concurrentPapers,
+                    remaining: remainingUploads,
+                },
+                rejectedFiles: excessFiles.map((f) => ({
+                    filename: f.originalname,
+                    error: "Upload limit exceeded",
+                })),
             });
         }
 
-        // Delete associated chat messages
-        await ChatMessage.deleteMany({ paper: id });
+        // Process uploaded papers
+        const results = await Promise.allSettled(
+            files.map((file) => processSinglePaper(file, user, req.body))
+        );
 
-        // Delete associated knowledge base
-        await KnowledgeBase.deleteOne({ paper: id });
+        const successfulUploads = results.filter(
+            (r) => r.status === "fulfilled"
+        ).length;
 
-        // Delete the paper itself
-        await Paper.findByIdAndDelete(id);
+        // Update user's monthly usage count
+        if (successfulUploads > 0) {
+            await User.findByIdAndUpdate(user._id, {
+                $inc: { "usage.currentMonthUploads": successfulUploads },
+            });
+        }
 
-        res.json({ message: "Paper and associated data deleted successfully" });
+        // Log processing summary
+        console.log(
+            `Processing completed for ${files.length} files. Success: ${successfulUploads}, Failed: ${results.length - successfulUploads}`
+        );
+
+        // Build response
+        const response = {
+            success: successfulUploads,
+            failed: results.length - successfulUploads,
+            papers: results.map((result, i) => {
+                if (result.status === "fulfilled" && result.value?.paper) {
+                    return {
+                        ...formatPaperResponse(result.value.paper),
+                        status: "fulfilled",
+                    };
+                } else {
+                    console.error(
+                        `Paper #${i + 1} failed or malformed result:`,
+                        result
+                    );
+                    return {
+                        error:
+                            result.reason?.message ||
+                            "Unknown error or malformed response",
+                        status: result.status,
+                    };
+                }
+            }),
+            limits: {
+                remaining: remainingUploads - successfulUploads,
+                monthlyLimit: user.uploadLimits.monthlyUploads,
+                concurrentLimit: user.uploadLimits.concurrentPapers,
+            },
+        };
+
+        res.status(response.failed > 0 ? 207 : 200).json(response);
     } catch (err) {
-        console.error("Error deleting paper:", err);
-        next(err);
+        console.error("UploadPapers Error:", err);
+        throw err; // Let asyncHandler convert it into proper ApiError response
     }
+});
+
+// Enhanced processing with progress tracking
+async function processSinglePaper(file, user, metadata) {
+    let paper;
+
+    try {
+        // ✅ Read file from disk safely
+        const absolutePath = path.resolve(file.path);
+        const buffer = await fs.readFile(absolutePath);
+
+        // ✅ Extract and validate text
+        const text = await extractTextFromPDF(buffer);
+        const chunks = chunkText(text); // Creating chunks for semantic search
+
+        // ✅ Create paper and placeholder KB
+        const [createdPaper] = await Promise.all([
+            Paper.create({
+                title: metadata.title || path.parse(file.originalname).name,
+                authors: metadata.authors || "",
+                abstract: metadata.abstract || "",
+                content: text,
+                user: user._id,
+                fileSize: file.size,
+                processingStatus: "analyzing",
+            }),
+            KnowledgeBase.create({
+                paper: null, // update later
+                aggregatedSummary: "Analysis in progress...",
+                aggregatedKeywords: [],
+                chunks: chunks.map((text) => ({ text })), // each chunk in an object
+            }),
+        ]);
+
+        paper = createdPaper;
+
+        // ✅ Update KB with paper ref
+        await KnowledgeBase.updateOne({ paper: null }, { paper: paper._id });
+
+        // ✅ Process with Gemini
+        const { aggregatedSummary, keywordsArray } =
+            await processChunksWithGemini(chunks, user, paper);
+
+        // ✅ Final updates
+        await Promise.all([
+            Paper.findByIdAndUpdate(paper._id, {
+                summary: aggregatedSummary,
+                keywords: keywordsArray,
+                processingStatus: "completed",
+            }),
+            KnowledgeBase.findOneAndUpdate(
+                { paper: paper._id },
+                {
+                    aggregatedSummary,
+                    aggregatedKeywords: keywordsArray,
+                }
+            ),
+        ]);
+
+        // ✅ Return paper with populated KB
+        return {
+            paper: await Paper.findById(paper._id)
+                .populate("knowledgeBase")
+                .lean(),
+        };
+    } catch (err) {
+        console.error("❌ processSinglePaper failed:", err);
+
+        // Rollback if paper was partially created
+        if (paper?._id) {
+            await Promise.allSettled([
+                Paper.findByIdAndDelete(paper._id),
+                KnowledgeBase.deleteOne({ paper: paper._id }),
+            ]);
+        }
+
+        return {
+            error: err.message || "Failed to process PDF",
+            filename: file.originalname,
+        };
+    } finally {
+        try {
+            await removeFile(file.path); // safe cleanup
+        } catch (cleanupError) {
+            console.warn(
+                "⚠️ Failed to clean up file:",
+                file.path,
+                cleanupError.message
+            );
+        }
+    }
+}
+
+// Helper functions
+async function processChunksWithGemini(chunks, user, paper) {
+    const result = await geminiService.analyzePaperChunks(
+        chunks,
+        null, // no previous summary initially
+        user.tier
+    );
+
+    if (!result || !Array.isArray(result.summaries)) {
+        throw new Error("Gemini analysis failed or returned invalid data.");
+    }
+
+    // Optional: store progress as 100% complete
+    await Paper.updateOne(
+        { _id: paper._id },
+        {
+            $set: {
+                processingProgress: 100,
+            },
+        }
+    );
+
+    return {
+        aggregatedSummary: await geminiService.refineSummary(
+            result.aggregatedSummary
+        ),
+        keywordsArray: result.keywordsArray,
+    };
+}
+
+function chunkText(text, chunkSize = 5000) {
+    return Array.from({ length: Math.ceil(text.length / chunkSize) }, (_, i) =>
+        text.slice(i * chunkSize, (i + 1) * chunkSize)
+    );
+}
+
+function formatPaperResponse(paper, textLength = null, chunkCount = null) {
+    if (!paper || !paper._id) {
+        throw new Error("Invalid paper object passed to formatPaperResponse");
+    }
+
+    return {
+        id: paper._id,
+        title: paper.title,
+        keywords: (paper.keywords || []).slice(0, 10),
+        originalTextLength: textLength || paper.content?.length || 0,
+        normalizedTextLength: paper.content?.length || 0,
+        chunksProcessed: chunkCount || 0,
+        createdAt: paper.createdAt,
+    };
+}
+
+function formatBatchResponse(results) {
+    return {
+        success: results.filter((r) => r.status === "fulfilled").length,
+        failed: results.filter((r) => r.status === "rejected").length,
+        papers: results.map((r) =>
+            r.value?.paper ? formatPaperResponse(r.value.paper) : null
+        ),
+        errors: results.map((r) => r.reason?.message || "Unknown error"),
+    };
+}
+
+export const getPapers = asyncHandler(async (req, res) => {
+    const papers = await Paper.find({ user: req.user.id })
+        .populate({
+            path: "knowledgeBase",
+            select: "aggregatedSummary aggregatedKeywords",
+        })
+        .select("title authors abstract createdAt keywords knowledgeBase summary")
+        .lean();
+
+    console.log(papers);
+
+    res.json(
+        papers.map((paper) => ({
+            ...paper,
+            // Flatten the knowledgeBase data
+            summary: paper.knowledgeBase?.aggregatedSummary || paper.summary || "",
+            keywords: paper.knowledgeBase?.aggregatedKeywords || paper.keywords,
+            // Remove the nested knowledgeBase if needed
+            knowledgeBase: undefined,
+        }))
+    );
+});
+
+export const getPaperById = asyncHandler(async (req, res) => {
+    const paper = await Paper.findById(req.params.id)
+        .populate({
+            path: "knowledgeBase",
+            select: "aggregatedSummary aggregatedKeywords chunks hierarchicalSummary",
+        })
+        .lean();
+
+    if (!paper) throw new ApiError(404, "Paper not found");
+    if (paper.user.toString() !== req.user.id) {
+        throw new ApiError(403, "Unauthorized access");
+    }
+
+    res.json({
+        ...paper,
+        knowledgeBase: paper.knowledgeBase || {
+            aggregatedSummary: "",
+            aggregatedKeywords: [],
+            chunks: [],
+            hierarchicalSummary: {},
+        },
+    });
+});
+
+export const deletePaper = asyncHandler(async (req, res) => {
+    const paper = await Paper.findById(req.params.id);
+    if (!paper) throw new ApiError(404, "Paper not found");
+    if (paper.user.toString() !== req.user.id) {
+        throw new ApiError(403, "Unauthorized operation");
+    }
+
+    await Promise.all([
+        ChatMessage.deleteMany({ paper: paper._id }),
+        KnowledgeBase.deleteOne({ paper: paper._id }),
+        Paper.findByIdAndDelete(paper._id),
+    ]);
+
+    res.json({ message: "Paper and associated data deleted successfully" });
 });
