@@ -1,232 +1,300 @@
 import Paper from "../models/paper.model.js";
 import KnowledgeBase from "../models/knowledgeBase.model.js";
 import ChatMessage from "../models/chatMessage.model.js";
-import geminiService from "../services/gemini.service.js";
+import {
+    SYSTEM_PROMPT,
+    generateChatResponse,
+    parseGeminiResponse,
+    callFunctionByName,
+} from "../services/gemini.service.js";
 import asyncHandler from "../utils/asyncHandler.js";
+import { ApiError } from "../utils/ApiError.js";
+import fs from "fs/promises";
+import path from "path";
+import pdfParse from "pdf-parse";
+import mongoose from "mongoose";
 
-// Process a chat message and get a response
-export const processChatMessage = asyncHandler(async (req, res, next) => {
+// not used
+export const getPaperDetails = asyncHandler(async (req, res) => {
+    const { paperId } = req.params;
+    const userId = req.user.id;
+
+    const paper = await Paper.findOne({ _id: paperId, user: userId })
+        .select("title authors abstract keywords createdAt")
+        .lean();
+
+    if (!paper) {
+        throw new ApiError(404, "Paper not found");
+    }
+
+    res.json({
+        success: true,
+        data: formatPaperResponse(paper),
+    });
+});
+
+export const processChatMessage = asyncHandler(async (req, res) => {
     const { paperId } = req.params;
     const { question } = req.body;
     const userId = req.user.id;
 
+    if (!question?.trim()) throw new ApiError(400, "Question is required");
+
+    const paper = await Paper.findOne({ _id: paperId, user: userId });
+    if (!paper) throw new ApiError(403, "Unauthorized access");
+
     try {
-        // Get the paper
-        const paper = await Paper.findById(paperId);
-        if (!paper) {
-            return res.status(404).json({ message: "Paper not found" });
-        }
-
-        // Check if the user has access to this paper
-        if (paper.user.toString() !== userId) {
-            return res.status(403).json({
-                message: "You don't have permission to access this paper",
-            });
-        }
-
-        // Save the user's message
-        const userMessage = new ChatMessage({
+        // Save user message first
+        const userMessage = await ChatMessage.create({
             paper: paperId,
             user: userId,
             content: question,
             role: "user",
         });
-        await userMessage.save();
 
-        // Get chat history for this paper-user combination
-        const chatHistory = await ChatMessage.find({
-            paper: paperId,
-            user: userId,
-        }).sort({ createdAt: 1 });
+        // Use a more direct approach - don't rely only on system message
+        // Include a more explicit function-calling instruction with each user message
+        const userPrompt = `
+I'm asking you about a research paper with ID: ${paperId}. Please use the following tools to answer my question:
+1. Use getPaperDetails() first to get basic information about the paper.
+2. Use searchKnowledgeBase("${question}") to find relevant passages from the paper.
+3. Use getChatHistory() if needed to see our previous conversation.
 
-        // Check if paper context has been provided yet in this conversation
-        const hasContextMessage = chatHistory.some(
-            (msg) =>
-                msg.role === "system" && msg.content.includes("PAPER DETAILS:")
-        );
+My question is: ${question}
 
-        // Prepare content for the API call
-        let prompt = "";
-        let contextUsed = {
-            paperDetailsIncluded: false,
-            knowledgeBaseIncluded: false,
-        };
-
-        // We'll always include paper context in the prompt for reliability
-        // This is the key change - not relying on the model's memory
-        const knowledgeBase = await KnowledgeBase.findOne({
-            paper: paperId,
-        });
-
-        prompt = `
-You are an AI assistant helping with a research paper. Answer the following question about this paper:
-
-PAPER DETAILS:
-Title: ${paper.title}
-Authors: ${paper.authors || "Not specified"}
-Abstract: ${paper.abstract || "Not provided"}
-Keywords: ${paper.keywords?.join(", ") || "None"}
+Remember to respond in this JSON format:
+\`\`\`json
+{
+  "function_call": {"name": "function_name", "parameters": {}},
+  "thinking_process": "your reasoning here",
+  "final_answer": null
+}
+\`\`\`
 `;
-        contextUsed.paperDetailsIncluded = true;
 
-        if (knowledgeBase) {
-            prompt += `
-KNOWLEDGE BASE:
-Summary: ${knowledgeBase.aggregatedSummary || "Not available"}
-Key Concepts: ${knowledgeBase.aggregatedKeywords?.join(", ") || "None"}
-Explanations: ${knowledgeBase.aggregatedExplanations || "Not available"}
-`;
-            contextUsed.knowledgeBaseIncluded = true;
-        }
+        // Start with an empty message history (no system prompt here)
+        const messageHistory = [{ role: "user", content: userPrompt }];
 
-        // Add recent message history (last 3-5 exchanges) for context
-        // Excluding system messages
-        const relevantHistory = chatHistory
-            .filter((msg) => msg.role !== "system")
-            .slice(-6); // Last 3 exchanges (3 user + 3 assistant messages)
+        const usedFunctions = new Set();
+        let contextData = {};
+        let finalAnswer = null;
 
-        if (relevantHistory.length > 0) {
-            prompt += `\nRECENT CONVERSATION:\n`;
-            for (const msg of relevantHistory) {
-                prompt += `${msg.role === "user" ? "User" : "Assistant"}: ${msg.content}\n\n`;
+        // Maximum number of turns to prevent infinite loops
+        const MAX_TURNS = 5;
+        let turns = 0;
+
+        while (turns < MAX_TURNS) {
+            turns++;
+
+            const rawResponse = await generateChatResponse(messageHistory);
+            const parsed = parseGeminiResponse(rawResponse);
+            console.log("Gemini response (turn " + turns + "):", parsed);
+
+            // Handle tool calling
+            if (parsed.function_call?.name) {
+                const { name, parameters } = parsed.function_call;
+                let toolResult = null;
+
+                try {
+                    if (name === "getPaperDetails") {
+                        toolResult = await callFunctionByName(
+                            name,
+                            paperId,
+                            userId
+                        );
+                    } else if (name === "getChatHistory") {
+                        toolResult = await callFunctionByName(
+                            name,
+                            paperId,
+                            userId,
+                            { limit: 5 }
+                        );
+                    } else if (name === "searchKnowledgeBase") {
+                        toolResult = await callFunctionByName(
+                            name,
+                            paperId,
+                            userId,
+                            {
+                                query: parameters?.query || question,
+                            }
+                        );
+                    }
+
+                    console.log(`Tool result (${name}):`, toolResult);
+
+                    usedFunctions.add(name);
+                    contextData[name] = toolResult;
+
+                    // Add function response to message history
+                    messageHistory.push({
+                        role: "function",
+                        name: name,
+                        content: toolResult,
+                    });
+
+                    // Ask for next step or final answer
+                    messageHistory.push({
+                        role: "user",
+                        content:
+                            "Now that you have the information from " +
+                            name +
+                            ", please continue with the next function call or provide your final answer.",
+                    });
+                } catch (funcErr) {
+                    console.error(`Error calling function ${name}:`, funcErr);
+                    messageHistory.push({
+                        role: "user",
+                        content: `There was an error calling ${name}. Please try another approach or provide a final answer based on what you know.`,
+                    });
+                }
+            } else {
+                // No more function_call: it's the final answer
+                finalAnswer =
+                    parsed.final_answer || "I'm not sure how to answer that.";
+                break;
             }
         }
 
-        // Add the current question
-        prompt += `\nUser: ${question}\n\nAssistant: `;
-
-        // If this is the first message in a conversation, create and save a system message
-        if (!hasContextMessage) {
-            const systemMessage = new ChatMessage({
-                paper: paperId,
-                user: userId,
-                content: `PAPER DETAILS:\nTitle: ${paper.title}\nAuthors: ${paper.authors || "Not specified"}\nAbstract: ${paper.abstract || "Not provided"}\nKeywords: ${paper.keywords?.join(", ") || "None"}${knowledgeBase ? `\n\nKNOWLEDGE BASE:\nSummary: ${knowledgeBase.aggregatedSummary || "Not available"}\nKey Concepts: ${knowledgeBase.aggregatedKeywords?.join(", ") || "None"}\nExplanations: ${knowledgeBase.aggregatedExplanations || "Not available"}` : ""}`,
-                role: "system",
-            });
-            await systemMessage.save();
-        }
-
-        // Get AI response using combined prompt
-        const aiResponse = await geminiService.generateResponse(prompt);
-
-        // Save the AI's response
-        const assistantMessage = new ChatMessage({
+        // Save assistant message only now
+        const assistantMessage = await ChatMessage.create({
             paper: paperId,
             user: userId,
-            content: aiResponse,
+            content: finalAnswer,
             role: "assistant",
+            metadata: {
+                functionsUsed: [...usedFunctions],
+                contextData: true,
+            },
         });
-        await assistantMessage.save();
 
-        // Return both messages
         res.json({
-            userMessage: userMessage,
-            assistantMessage: assistantMessage,
-            contextUsed,
+            question: formatMessage(userMessage),
+            answer: formatMessage(assistantMessage),
+            context: contextData,
         });
     } catch (err) {
-        console.error("Error processing chat message:", err);
-        next(err);
+        throw new ApiError(500, "Chat processing failed", err);
     }
 });
 
-// Other functions remain the same
-export const getChatHistory = asyncHandler(async (req, res, next) => {
+// not used
+export const getChatHistory = asyncHandler(async (req, res) => {
     const { paperId } = req.params;
     const userId = req.user.id;
 
-    try {
-        // First verify the user has access to this paper
-        const paper = await Paper.findById(paperId);
-        if (!paper) {
-            return res.status(404).json({ message: "Paper not found" });
-        }
+    const paper = await Paper.exists({ _id: paperId, user: userId });
+    if (!paper) throw new ApiError(403, "Unauthorized access");
 
-        if (paper.user.toString() !== userId) {
-            return res.status(403).json({
-                message: "You don't have permission to access this paper",
-            });
-        }
+    const messages = await ChatMessage.find({
+        paper: paperId,
+        user: userId,
+        role: { $in: ["user", "assistant"] },
+    })
+        .sort({ createdAt: 1 })
+        .select("content role createdAt metadata")
+        .lean();
 
-        // Get chat messages for this paper, excluding system messages
-        const messages = await ChatMessage.find({
-            paper: paperId,
-            user: userId,
-            role: { $ne: "system" }, // Exclude system messages from the frontend
-        }).sort({ createdAt: 1 });
-
-        res.json(messages);
-    } catch (err) {
-        console.error("Error getting chat history:", err);
-        next(err);
-    }
+    res.json(messages.map(formatMessage));
 });
 
-export const getPaperDetails = asyncHandler(async (req, res, next) => {
-    const { paperId } = req.params;
-    const userId = req.user.id;
-
-    try {
-        const paper = await Paper.findById(paperId);
-        if (!paper) {
-            return res.status(404).json({ message: "Paper not found" });
-        }
-
-        if (paper.user.toString() !== userId) {
-            return res.status(403).json({
-                message: "You don't have permission to access this paper",
-            });
-        }
-
-        // Return only essential paper details
-        res.json({
-            title: paper.title,
-            authors: paper.authors,
-            abstract: paper.abstract,
-            keywords: paper.keywords,
-            citations: paper.citations,
-        });
-    } catch (err) {
-        console.error("Error getting paper details:", err);
-        next(err);
-    }
-});
-
-export const addSystemMessage = asyncHandler(async (req, res, next) => {
+// not used
+export const addSystemMessage = asyncHandler(async (req, res) => {
     const { paperId } = req.params;
     const { content } = req.body;
     const userId = req.user.id;
 
+    if (!content?.trim()) throw new ApiError(400, "Content is required");
+
+    const paper = await Paper.exists({ _id: paperId, user: userId });
+    if (!paper) throw new ApiError(403, "Unauthorized access");
+
+    const systemMessage = await ChatMessage.create({
+        paper: paperId,
+        user: userId,
+        content: content.trim(),
+        role: "system",
+        metadata: { systemNote: true },
+    });
+
+    res.json(formatMessage(systemMessage));
+});
+
+export const chatUploadPaper = asyncHandler(async (req, res) => {
+    const { chatId } = req.params;
+    const file = req.file;
+    const user = req.user;
+
+    if (!file) throw new ApiError(400, "No file uploaded");
+
     try {
-        // Get the paper
-        const paper = await Paper.findById(paperId);
-        if (!paper) {
-            return res.status(404).json({ message: "Paper not found" });
+        // Validate chat ownership
+        const chat = await ChatMessage.findById(chatId);
+        if (!chat || chat.user.toString() !== user._id.toString()) {
+            await fs.unlink(file.path);
+            throw new ApiError(404, "Invalid chat session");
         }
 
-        // Check if the user has access to this paper
-        if (paper.user.toString() !== userId) {
-            return res.status(403).json({
-                message: "You don't have permission to access this paper",
-            });
-        }
-
-        // Save the system message
-        const systemMessage = new ChatMessage({
-            paper: paperId,
-            user: userId,
-            content: content,
-            role: "system",
+        // Process paper
+        const text = await extractTextFromPDF(file.buffer);
+        const paper = await Paper.create({
+            title: path.parse(file.originalname).name,
+            content: text,
+            user: user._id,
+            fileSize: file.size,
         });
-        await systemMessage.save();
 
-        // Return the message
+        // Update chat message with paper reference
+        const updatedChat = await ChatMessage.findByIdAndUpdate(
+            chatId,
+            {
+                $set: {
+                    paper: paper._id,
+                    metadata: {
+                        ...chat.metadata,
+                        uploadedPaper: paper._id,
+                    },
+                },
+            },
+            { new: true }
+        ).lean();
+
         res.json({
-            message: "System message added successfully",
-            systemMessage: systemMessage,
+            success: true,
+            paper: formatPaperResponse(paper),
+            chat: formatMessage(updatedChat),
         });
     } catch (err) {
-        console.error("Error adding system message:", err);
-        next(err);
+        await fs.unlink(file.path).catch(() => {});
+        throw new ApiError(500, "Paper upload failed", err);
     }
 });
+
+// Helper functions
+function formatMessage(message) {
+    return {
+        id: message._id,
+        content: message.content,
+        role: message.role,
+        createdAt: message.createdAt,
+        metadata: message.metadata || {},
+    };
+}
+
+function formatPaperResponse(paper) {
+    return {
+        id: paper._id,
+        title: paper.title,
+        abstract: paper.abstract,
+        keywords: paper.keywords,
+        createdAt: paper.createdAt,
+    };
+}
+
+async function extractTextFromPDF(buffer) {
+    try {
+        const data = await pdfParse(buffer);
+        return data.text.replace(/\s+/g, " ").trim();
+    } catch (err) {
+        throw new ApiError(400, "Invalid PDF file");
+    }
+}
