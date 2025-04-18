@@ -14,7 +14,6 @@ import path from "path";
 import pdfParse from "pdf-parse";
 import mongoose from "mongoose";
 
-// not used
 export const getPaperDetails = asyncHandler(async (req, res) => {
     const { paperId } = req.params;
     const userId = req.user.id;
@@ -52,34 +51,83 @@ export const processChatMessage = asyncHandler(async (req, res) => {
             role: "user",
         });
 
-        // Use a more direct approach - don't rely only on system message
-        // Include a more explicit function-calling instruction with each user message
-        const userPrompt = `
-I'm asking you about a research paper with ID: ${paperId}. Please use the following tools to answer my question:
-1. Use getPaperDetails() first to get basic information about the paper.
-2. Use searchKnowledgeBase("${question}") to find relevant passages from the paper.
-3. Use getChatHistory() if needed to see our previous conversation.
-
-My question is: ${question}
-
-Remember to respond in this JSON format:
-\`\`\`json
-{
-  "function_call": {"name": "function_name", "parameters": {}},
-  "thinking_process": "your reasoning here",
-  "final_answer": null
-}
-\`\`\`
-`;
-
-        // Start with an empty message history (no system prompt here)
-        const messageHistory = [{ role: "user", content: userPrompt }];
-
+        // Initialize contextData and track used functions
         const usedFunctions = new Set();
         let contextData = {};
-        let finalAnswer = null;
+        let paperDetails = null; // Declare in outer scope
 
-        // Maximum number of turns to prevent infinite loops
+        // Start with initial context gathering
+        try {
+            // First get paper details
+            paperDetails = await callFunctionByName(
+                "getPaperDetails",
+                paperId,
+                userId
+            );
+            contextData["getPaperDetails"] = paperDetails;
+            usedFunctions.add("getPaperDetails");
+
+            // Initial search
+            const initialSearchResult = await callFunctionByName(
+                "searchKnowledgeBase",
+                paperId,
+                userId,
+                { query: question }
+            );
+
+            // Fallback if no results
+            if (!initialSearchResult || initialSearchResult.length === 0) {
+                console.log("Initial search failed, trying individual terms");
+
+                // Use QUESTION variable instead of undefined 'query'
+                const queryTerms = question
+                    .trim()
+                    .split(/\s+/)
+                    .filter((term) => term.length > 0);
+
+                for (const term of queryTerms) {
+                    const termResults = await callFunctionByName(
+                        "searchKnowledgeBase",
+                        paperId,
+                        userId,
+                        { query: term }
+                    );
+                    if (termResults.length > 0) {
+                        contextData["searchKnowledgeBase"] = termResults;
+                        usedFunctions.add("searchKnowledgeBase");
+                        break;
+                    }
+                }
+            } else {
+                contextData["searchKnowledgeBase"] = initialSearchResult;
+                usedFunctions.add("searchKnowledgeBase");
+            }
+        } catch (preSearchErr) {
+            console.error("Initial context error:", preSearchErr);
+        }
+
+        // Build initial prompt with proper fallbacks
+        let initialPrompt = `${SYSTEM_PROMPT}\n\n`;
+
+        // Add paper details from contextData or direct paper object
+        if (contextData.getPaperDetails) {
+            initialPrompt += `Paper Details: ${JSON.stringify(contextData.getPaperDetails)}\n\n`;
+        } else {
+            initialPrompt += `Paper Title: ${paper.title}\nAbstract: ${paper.abstract}\n\n`;
+        }
+
+        // Add search context with fallback
+        if (contextData.searchKnowledgeBase?.length > 0) {
+            initialPrompt += `Relevant Context: ${JSON.stringify(contextData.searchKnowledgeBase)}\n\n`;
+        } else {
+            initialPrompt += `No relevant passages found. Using paper abstract:\n"${paper.abstract}"\n\n`;
+        }
+
+        initialPrompt += `My question is: ${question}\n\nPlease respond in JSON format with function_call if you need more info or final_answer if you can answer now.`;
+
+        // Rest of the original logic remains the same
+        const messageHistory = [{ role: "user", content: initialPrompt }];
+        let finalAnswer = null;
         const MAX_TURNS = 5;
         let turns = 0;
 
@@ -132,14 +180,57 @@ Remember to respond in this JSON format:
                         content: toolResult,
                     });
 
-                    // Ask for next step or final answer
-                    messageHistory.push({
-                        role: "user",
-                        content:
-                            "Now that you have the information from " +
-                            name +
-                            ", please continue with the next function call or provide your final answer.",
-                    });
+                    // Provide better guidance based on function call results
+                    if (name === "getPaperDetails") {
+                        messageHistory.push({
+                            role: "user",
+                            content:
+                                "Now that you have the paper details, please search for specific relevant information in the knowledge base. Use short, specific technical terms from the paper (like key concepts mentioned in the abstract or keywords) that would likely appear in explanatory passages.",
+                        });
+                    } else if (name === "searchKnowledgeBase") {
+                        if (!toolResult || toolResult.length === 0) {
+                            // If the search returned no results, try alternative searches
+                            // Extract paper details if available
+                            const paperDetails = contextData["getPaperDetails"];
+
+                            if (
+                                paperDetails &&
+                                paperDetails.keywords &&
+                                paperDetails.keywords.length > 0
+                            ) {
+                                // Suggest using keywords from the paper
+                                const keywordSuggestions = paperDetails.keywords
+                                    .slice(0, 3)
+                                    .join(", ");
+                                messageHistory.push({
+                                    role: "user",
+                                    content: `The search didn't return any results for "${parameters?.query || question}". Please try another search using more specific technical terms from the paper. Consider searching for these keywords from the paper: ${keywordSuggestions}, or try breaking down your query into smaller, more specific terms.`,
+                                });
+                            } else {
+                                // Generic fallback if no keywords available
+                                messageHistory.push({
+                                    role: "user",
+                                    content: `The search didn't return any results for "${parameters?.query || question}". Please try another search using different terms or concepts from the paper's abstract.`,
+                                });
+                            }
+                        } else {
+                            // Normal flow if search returned results
+                            messageHistory.push({
+                                role: "user",
+                                content:
+                                    "Based on these search results, please continue with any other function calls needed or provide your final answer. If these results don't fully answer the question, consider searching for additional relevant terms.",
+                            });
+                        }
+                    } else {
+                        // Default message for other function calls
+                        messageHistory.push({
+                            role: "user",
+                            content:
+                                "Now that you have the information from " +
+                                name +
+                                ", please continue with the next function call or provide your final answer.",
+                        });
+                    }
                 } catch (funcErr) {
                     console.error(`Error calling function ${name}:`, funcErr);
                     messageHistory.push({
@@ -153,9 +244,18 @@ Remember to respond in this JSON format:
                     parsed.final_answer || "I'm not sure how to answer that.";
                 break;
             }
+
+            // If we've reached the final turn and still have no answer, force a final response
+            if (turns === MAX_TURNS - 1) {
+                messageHistory.push({
+                    role: "user",
+                    content:
+                        "Please provide your final answer based on the information you've gathered so far, even if it's incomplete.",
+                });
+            }
         }
 
-        // Save assistant message only now
+        // Save assistant message
         const assistantMessage = await ChatMessage.create({
             paper: paperId,
             user: userId,
@@ -173,11 +273,16 @@ Remember to respond in this JSON format:
             context: contextData,
         });
     } catch (err) {
+        console.error("Full error details:", {
+            error: err,
+            paperId,
+            userId,
+            question,
+        });
         throw new ApiError(500, "Chat processing failed", err);
     }
 });
 
-// not used
 export const getChatHistory = asyncHandler(async (req, res) => {
     const { paperId } = req.params;
     const userId = req.user.id;
@@ -197,7 +302,6 @@ export const getChatHistory = asyncHandler(async (req, res) => {
     res.json(messages.map(formatMessage));
 });
 
-// not used
 export const addSystemMessage = asyncHandler(async (req, res) => {
     const { paperId } = req.params;
     const { content } = req.body;

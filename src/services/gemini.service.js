@@ -303,6 +303,10 @@ export function parseGeminiResponse(response) {
     }
 }
 
+function escapeRegExp(string) {
+    return string.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 // ------------------ Function Call Registry ------------------
 const FUNCTION_HANDLERS = {
     getPaperDetails: async (paperId, userId) => {
@@ -321,25 +325,73 @@ const FUNCTION_HANDLERS = {
         };
     },
 
+    // 1. Improve the searchKnowledgeBase function
     searchKnowledgeBase: async (paperId, userId, { query, maxResults = 3 }) => {
+        // Create multiple query terms by splitting the query and using each word separately
+        const queryTerms = query.split(/\s+/).filter((term) => term.length > 3); // Only use words longer than 3 chars
+
+        let regexPattern;
+        if (queryTerms.length > 0) {
+            const escapedTerms = queryTerms.map((term) => escapeRegExp(term));
+            // Create regex with lookaheads to require all terms
+            const lookaheads = escapedTerms
+                .map((term) => `(?=.*${term})`)
+                .join("");
+            regexPattern = new RegExp(`^${lookaheads}.*$`, "i");
+        } else {
+            regexPattern = new RegExp(query, "i");
+        }
+
         const results = await KnowledgeBase.aggregate([
-            { $match: { paper: new mongoose.Types.ObjectId(paperId) } },
-            { $unwind: "$chunks" },
             {
                 $match: {
-                    "chunks.text": { $regex: query, $options: "i" }, // Simple keyword match
+                    paper: new mongoose.Types.ObjectId(paperId),
+                    $text: { $search: query },
                 },
             },
+            { $unwind: "$chunks" },
+            {
+                $sort: {
+                    score: { $meta: "textScore" }, // Sort by relevance
+                },
+            },
+            { $limit: 3 },
             {
                 $project: {
                     text: "$chunks.text",
                     _id: 0,
+                    score: { $meta: "textScore" },
                 },
             },
-            { $limit: maxResults },
         ]);
 
-        return results.map((r) => r.text); // Just return array of strings
+        if (results.length === 0 && queryTerms.length > 1) {
+            // If no results and multiple terms, try with individual term searches
+            const individualSearchPromises = queryTerms.map((term) =>
+                KnowledgeBase.aggregate([
+                    { $match: { paper: new mongoose.Types.ObjectId(paperId) } },
+                    { $unwind: "$chunks" },
+                    {
+                        $match: {
+                            "chunks.text": { $regex: new RegExp(term, "i") },
+                        },
+                    },
+                    { $project: { text: "$chunks.text", _id: 0 } },
+                    { $limit: 1 },
+                ])
+            );
+
+            const individualResults = await Promise.all(
+                individualSearchPromises
+            );
+            const flatResults = individualResults.flat();
+
+            if (flatResults.length > 0) {
+                return flatResults.slice(0, maxResults).map((r) => r.text);
+            }
+        }
+
+        return results.map((r) => r.text);
     },
 
     getChatHistory: async (paperId, userId, limit = 5) => {

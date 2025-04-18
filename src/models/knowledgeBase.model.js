@@ -9,6 +9,8 @@ const ChunkSchema = new mongoose.Schema({
     embeddings: [Number], // For semantic search
 });
 
+ChunkSchema.index({ text: "text" });
+
 const HierarchicalSectionSchema = new mongoose.Schema({
     title: String,
     summary: String,
