@@ -30,6 +30,8 @@ const RATE_LIMIT = {
 
 const CACHE_DURATION = 10 * 60 * 1000; // 10 mins
 const memoryCache = new Map(); // Key: `${userId}:${paperId}`, Value: { getPaperDetails, searchKnowledgeBase, getChatHistory }
+const PAPER_CONTEXT_CACHE = new Map(); // Key: paperId
+const SEARCH_RESULT_CACHE = new Map(); // Key: paperId+query
 
 let requestCount = 0;
 let lastRequestTime = Date.now();
@@ -209,92 +211,248 @@ Output:
 // =======================
 
 // ------------------ System Prompt ------------------
+// export const SYSTEM_PROMPT = `
+// You are an AI research assistant specialized in helping users understand academic papers.
+
+// Context:
+// - The user is asking questions about a specific paper (paperId is already known).
+// - You can call tools to retrieve information about the paper and related content.
+// - The Database is a collection of chunks of text from the paper in MongoDB.
+
+// Functions available:
+// 1. getPaperDetails(): Returns title, abstract, and keywords of the paper.
+// 2. searchKnowledgeBase(query, maxResults=3): Returns chunks of text relevant to a given question.
+// 3. getChatHistory(limit=5): Retrieves the most recent user-assistant interactions.
+
+// Instructions:
+// - Always begin by calling getPaperDetails and getChatHistory (limit=5).
+// - When a user asks a question, always perform a searchKnowledgeBase(query).
+// - If searchKnowledgeBase returns no results, fall back to using the abstract, summary, or keywords from getPaperDetails.
+// - Use the retrieved context to generate the final answer.
+// - Do not ask for paper ID. It is already known.
+
+// Response protocol:
+// - Use the following JSON format:
+// \`\`\`json
+// {
+//   "function_call": {
+//     "name": "function_name",
+//     "parameters": { ... }
+//   },
+//   "thinking_process": "reasoning steps",
+//   "final_answer": "direct answer when all needed context is available"
+// }
+// \`\`\`
+
+// Important:
+// - If you need to call a function (like searchKnowledgeBase), return a function_call and leave final_answer empty or incomplete.
+// - Only provide a complete final_answer once you have all the necessary context.
+// - The final assistant message shown to the user will only be the final_answer after all tool calls are complete.
+// `;
+
 export const SYSTEM_PROMPT = `
-You are an AI research assistant specialized in helping users understand academic papers.
+You are an AI research assistant with two response modes. Follow these rules:
 
-Context:
-- The user is asking questions about a specific paper (paperId is already known).
-- You can call tools to retrieve information about the paper and related content.
-- The Database is a collection of chunks of text from the paper in MongoDB.
-
-Functions available:
-1. getPaperDetails(): Returns title, abstract, and keywords of the paper.
-2. searchKnowledgeBase(query, maxResults=3): Returns chunks of text relevant to a given question.
-3. getChatHistory(limit=5): Retrieves the most recent user-assistant interactions.
-
-Instructions:
-- Always begin by calling getPaperDetails and getChatHistory (limit=5).
-- When a user asks a question, always perform a searchKnowledgeBase(query).
-- If searchKnowledgeBase returns no results, fall back to using the abstract, summary, or keywords from getPaperDetails.
-- Use the retrieved context to generate the final answer.
-- Do not ask for paper ID. It is already known.
-
-Response protocol:
-- Use the following JSON format:
+# Response Modes
+1. General Conversations (use this for greetings/simple queries):
 \`\`\`json
 {
-  "function_call": {
-    "name": "function_name",
-    "parameters": { ... }
-  },
-  "thinking_process": "reasoning steps",
-  "final_answer": "direct answer when all needed context is available"
+  "final_answer": {
+    "content": {
+      "main_idea": "Your natural language response here"
+    }
+  }
 }
 \`\`\`
 
-Important:
-- If you need to call a function (like searchKnowledgeBase), return a function_call and leave final_answer empty or incomplete.
-- Only provide a complete final_answer once you have all the necessary context.
-- The final assistant message shown to the user will only be the final_answer after all tool calls are complete.
+2. Paper Analysis Mode (use this for technical questions):
+\`\`\`json
+{
+  "function_call": {
+    "name": "searchKnowledgeBase",
+    "parameters": {
+      "query": "optimized terms",
+      "context_hints": ["section references"]
+    }
+  },
+  "thinking_process": [
+    {"depth": "technical/general"},
+    {"user_needs": "analysis type"},
+    {"sections": "relevant sections"}
+  ],
+  "final_answer": {
+    "structure": "format-type",
+    "content": {
+      "main_idea": "...",
+      "supporting_evidence": ["...", "..."],
+      "critical_analysis": "..."
+    }
+  }
+}
+\`\`\`
+
+# Critical Protocol
+┌───────────────────────┬───────────────────────────────┐
+│ Question Type         │ Response Structure            │
+├───────────────────────┼───────────────────────────────┤
+│ Greetings/smalltalk   │ General Conversations JSON    │
+│ Simple paper queries  │ Minimum 1 evidence + analysis │
+│ Technical questions   │ Full analysis structure       │
+└───────────────────────┴───────────────────────────────┘
+
+# Allowed Functions (STRICTLY USE ONLY THESE)
+1. getPaperDetails - Get paper metadata
+2. searchKnowledgeBase - Search paper content
+3. getChatHistory - Get conversation history
+
+# Validation Rules
+1. Natural Language Responses MUST:
+- Contain ONLY "final_answer.content.main_idea"
+- NO function_calls
+- NO thinking_process
+
+2. Paper Analysis Responses MUST:
+- Include ALL: function_call, thinking_process, final_answer
+- Minimum 2 supporting_evidence entries
+- Section references in context_hints
+- Always give response in detailed manner (understand and use your knowledge to elaborate it further) and provide different length of answers according to the user needs.
+
+# Example Responses
+1. For "Hello":
+\`\`\`json
+{
+  "final_answer": {
+    "content": {
+      "main_idea": "Hello! How can I assist you with the research paper today?"
+    }
+  }
+}
+\`\`\`
+
+2. For "Explain PSO variations":
+\`\`\`json
+{
+  "function_call": {
+    "name": "searchKnowledgeBase",
+    "parameters": {
+      "query": "PSO variations algorithm development",
+      "context_hints": ["Section 3"]
+    }
+  },
+  "thinking_process": [
+    {"depth": "technical"},
+    {"user_needs": "algorithm comparison"},
+    {"sections": "Methodology, Results"}
+  ],
+  "final_answer": {
+    "structure": "comparative-list",
+    "content": {
+      "main_idea": "The paper describes 5 key PSO variations...",
+      "supporting_evidence": [
+        "Section 3.1: Nearest Neighbor Velocity Matching...",
+        "Section 3.2: Cornfield Vector approach..."
+      ],
+      "critical_analysis": "These variations demonstrate..."
+    }
+  }
+}
+\`\`\`
+
+# Critical Implementation
+1. Never make redundant calls - check cache first using:
+   - PaperDetailsCache
+   - SearchResultCache[query]
+   - ChatHistoryBuffer
+
+2. ALWAYS escape special characters:
+- " becomes \\"
+- ' becomes \\'
+- Newlines become \\n
+
+3. Example of proper escaping:
+\`\`\`json
+{
+  "content": "This is a properly escaped example: PSO\\'s effectiveness"
+}
+\`\`\`
 `;
 
 // ------------------ Response Parser ------------------
+// export function parseGeminiResponse(response) {
+//     try {
+//         // Case 1: Already a JS object
+//         if (typeof response === "object" && response !== null) {
+//             return response;
+//         }
+
+//         // Make sure response is a string
+//         if (typeof response !== "string") {
+//             console.warn("Unexpected response type:", typeof response);
+//             return {
+//                 function_call: null,
+//                 thinking_process: null,
+//                 final_answer: String(response),
+//             };
+//         }
+
+//         // Case 2: String with ```json block
+//         const jsonBlockMatch = response.match(/```json\s*([\s\S]*?)```/);
+//         if (jsonBlockMatch) {
+//             try {
+//                 return JSON.parse(jsonBlockMatch[1]);
+//             } catch (jsonErr) {
+//                 console.warn("Failed to parse JSON block:", jsonErr);
+//                 // Fall through to Case 4
+//             }
+//         }
+
+//         // Case 3: Plain JSON string
+//         if (response.trim().startsWith("{") && response.trim().endsWith("}")) {
+//             try {
+//                 return JSON.parse(response);
+//             } catch (jsonErr) {
+//                 console.warn("Failed to parse JSON string:", jsonErr);
+//                 // Fall through to Case 4
+//             }
+//         }
+
+//         // Case 4: Not JSON at all, just text response
+//         return {
+//             function_call: null,
+//             thinking_process: null,
+//             final_answer: response.trim(),
+//         };
+//     } catch (err) {
+//         console.error("Failed to parse Gemini response:", err);
+//         return {
+//             function_call: null,
+//             thinking_process: null,
+//             final_answer: "Error processing response",
+//         };
+//     }
+// }
+
 export function parseGeminiResponse(response) {
     try {
-        // Case 1: Already a JS object
-        if (typeof response === "object" && response !== null) {
-            return response;
-        }
+        if (typeof response === "object") return response;
 
-        // Make sure response is a string
-        if (typeof response !== "string") {
-            console.warn("Unexpected response type:", typeof response);
-            return {
-                function_call: null,
-                thinking_process: null,
-                final_answer: String(response),
-            };
-        }
+        // Convert to string if it's not already
+        const responseStr =
+            typeof response === "string" ? response : JSON.stringify(response);
 
-        // Case 2: String with ```json block
-        const jsonBlockMatch = response.match(/```json\s*([\s\S]*?)```/);
-        if (jsonBlockMatch) {
-            try {
-                return JSON.parse(jsonBlockMatch[1]);
-            } catch (jsonErr) {
-                console.warn("Failed to parse JSON block:", jsonErr);
-                // Fall through to Case 4
-            }
-        }
+        // Clean up code block formatting and trim
+        let jsonString = responseStr
+            .replace(/```json\s*/gi, "") // Remove opening ```json
+            .replace(/```/g, "") // Remove closing ```
+            .trim();
 
-        // Case 3: Plain JSON string
-        if (response.trim().startsWith("{") && response.trim().endsWith("}")) {
-            try {
-                return JSON.parse(response);
-            } catch (jsonErr) {
-                console.warn("Failed to parse JSON string:", jsonErr);
-                // Fall through to Case 4
-            }
-        }
-
-        // Case 4: Not JSON at all, just text response
-        return {
-            function_call: null,
-            thinking_process: null,
-            final_answer: response.trim(),
-        };
-    } catch (err) {
-        console.error("Failed to parse Gemini response:", err);
+        // Try parsing directly
+        return JSON.parse(jsonString);
+    } catch (error) {
+        console.error("JSON Parse Error:", {
+            error: error.message,
+            rawResponse: response,
+        });
         return {
             function_call: null,
             thinking_process: null,
@@ -302,6 +460,25 @@ export function parseGeminiResponse(response) {
         };
     }
 }
+
+const validateJSONString = (str) => {
+    try {
+        JSON.parse(str);
+    } catch (error) {
+        const positionMatch = error.message.match(/position (\d+)/);
+        if (positionMatch) {
+            const errorPosition = parseInt(positionMatch[1], 10);
+            const context = str.slice(
+                Math.max(0, errorPosition - 20),
+                errorPosition + 20
+            );
+            throw new Error(
+                `JSON validation failed: ${error.message}\nContext: ${context}`
+            );
+        }
+        throw error;
+    }
+};
 
 function escapeRegExp(string) {
     return string.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -325,7 +502,7 @@ const FUNCTION_HANDLERS = {
         };
     },
 
-    // 1. Improve the searchKnowledgeBase function
+    // searchKnowledgeBase function
     searchKnowledgeBase: async (paperId, userId, { query, maxResults = 3 }) => {
         // Create multiple query terms by splitting the query and using each word separately
         const queryTerms = query.split(/\s+/).filter((term) => term.length > 3); // Only use words longer than 3 chars
@@ -415,18 +592,35 @@ export const callFunctionByName = async (
     params = {}
 ) => {
     const cacheKey = `${userId}:${paperId}`;
+
     if (!memoryCache.has(cacheKey)) {
         memoryCache.set(cacheKey, {});
     }
 
     const paperCache = memoryCache.get(cacheKey);
 
-    // Cache `getPaperDetails`
+    // Paper-level context cache
     if (name === "getPaperDetails") {
-        if (paperCache.getPaperDetails) return paperCache.getPaperDetails;
+        if (PAPER_CONTEXT_CACHE.has(paperId)) {
+            return PAPER_CONTEXT_CACHE.get(paperId);
+        }
+        const result = await FUNCTION_HANDLERS[name](paperId, userId);
+        PAPER_CONTEXT_CACHE.set(paperId, result);
+        return result;
+    }
 
-        const result = await FUNCTION_HANDLERS.getPaperDetails(paperId, userId);
-        paperCache.getPaperDetails = result;
+    // Search result cache
+    if (name === "searchKnowledgeBase") {
+        const queryKey = `${paperId}-${params.query}`;
+        // Cache validation
+        if (SEARCH_RESULT_CACHE.has(queryKey)) {
+            const cached = SEARCH_RESULT_CACHE.get(queryKey);
+            if (cached.length >= params.maxResults) {
+                return cached.slice(0, params.maxResults);
+            }
+        }
+        const result = await FUNCTION_HANDLERS[name](paperId, userId, params);
+        SEARCH_RESULT_CACHE.set(queryKey, result);
         return result;
     }
 
@@ -440,23 +634,6 @@ export const callFunctionByName = async (
             params.limit || 5
         );
         paperCache.getChatHistory = result;
-        return result;
-    }
-
-    // Cache `searchKnowledgeBase` per query
-    if (name === "searchKnowledgeBase") {
-        const query = params.query || "";
-        paperCache.searchKnowledgeBase = paperCache.searchKnowledgeBase || {};
-        if (paperCache.searchKnowledgeBase[query]) {
-            return paperCache.searchKnowledgeBase[query];
-        }
-
-        const result = await FUNCTION_HANDLERS.searchKnowledgeBase(
-            paperId,
-            userId,
-            params // Pass the entire params object, not spreading it
-        );
-        paperCache.searchKnowledgeBase[query] = result;
         return result;
     }
 
@@ -500,6 +677,7 @@ export const generateChatResponse = async (
 
         // Send message with modified content
         const result = await chat.sendMessage(messageContent);
+        console.log("Gemini Raw Response: ", result.response.text());
         return result.response.text();
     } catch (err) {
         console.error("Chat error:", err);

@@ -14,6 +14,103 @@ import path from "path";
 import pdfParse from "pdf-parse";
 import mongoose from "mongoose";
 
+// Helper functions
+function formatMessage(message) {
+    return {
+        id: message._id,
+        content: message.content,
+        role: message.role,
+        createdAt: message.createdAt,
+        metadata: message.metadata || {},
+    };
+}
+
+function formatPaperResponse(paper) {
+    return {
+        id: paper._id,
+        title: paper.title,
+        abstract: paper.abstract,
+        keywords: paper.keywords,
+        createdAt: paper.createdAt,
+    };
+}
+
+async function extractTextFromPDF(buffer) {
+    try {
+        const data = await pdfParse(buffer);
+        return data.text.replace(/\s+/g, " ").trim();
+    } catch (err) {
+        throw new ApiError(400, "Invalid PDF file");
+    }
+}
+
+const buildInitialPrompt = (paper, contextData, question) => {
+    let prompt = `${SYSTEM_PROMPT}\n\n`;
+
+    prompt += contextData.getPaperDetails
+        ? `Paper Details: ${JSON.stringify(contextData.getPaperDetails)}\n\n`
+        : `Paper Title: ${paper.title}\nAbstract: ${paper.abstract}\n\n`;
+
+    prompt +=
+        contextData.searchKnowledgeBase?.length > 0
+            ? `Relevant Context: ${JSON.stringify(contextData.searchKnowledgeBase)}\n\n`
+            : `No relevant passages found. Using paper abstract:\n"${paper.abstract}"\n\n`;
+
+    return (
+        prompt + `My question is: ${question}\n\nPlease respond in JSON format.`
+    );
+};
+
+const handleFunctionCall = async (name, paperId, userId, params) => {
+    const validFunctions = new Set([
+        "getPaperDetails",
+        "searchKnowledgeBase",
+        "getChatHistory",
+    ]);
+
+    if (!validFunctions.has(name)) {
+        throw new Error(
+            `Invalid function call: ${name}. Valid options: ${[...validFunctions].join(", ")}`
+        );
+    }
+
+    return callFunctionByName(name, paperId, userId, params);
+};
+
+const validateResponseStructure = (parsed) => {
+    // Allow empty evidence for general responses
+    if (parsed.final_answer?.content && parsed.final_answer.content.main_idea) {
+        return null;
+    }
+
+    // For paper analysis questions
+    if (!parsed.final_answer?.content || !parsed.thinking_process) {
+        return "Invalid format. Required: main_idea, thinking_process";
+    }
+
+    return null;
+};
+
+const formatFinalAnswer = (parsed) => {
+    if (!parsed.final_answer?.content) return "Could not generate response";
+
+    const { main_idea, supporting_evidence, critical_analysis } =
+        parsed.final_answer.content;
+
+    // Detect general conversation format (aligned with system prompt)
+    if (main_idea && !parsed.function_call && !parsed.thinking_process) {
+        return main_idea;
+    }
+
+    // Paper analysis format
+    return (
+        `Main Idea: ${main_idea || "Not specified"}\n\n` +
+        `Evidence:\n${(supporting_evidence || []).join("\n")}\n\n` +
+        `Analysis: ${critical_analysis || "No analysis provided"}`
+    );
+};
+
+// Controller functions
 export const getPaperDetails = asyncHandler(async (req, res) => {
     const { paperId } = req.params;
     const userId = req.user.id;
@@ -30,257 +127,6 @@ export const getPaperDetails = asyncHandler(async (req, res) => {
         success: true,
         data: formatPaperResponse(paper),
     });
-});
-
-export const processChatMessage = asyncHandler(async (req, res) => {
-    const { paperId } = req.params;
-    const { question } = req.body;
-    const userId = req.user.id;
-
-    if (!question?.trim()) throw new ApiError(400, "Question is required");
-
-    const paper = await Paper.findOne({ _id: paperId, user: userId });
-    if (!paper) throw new ApiError(403, "Unauthorized access");
-
-    try {
-        // Save user message first
-        const userMessage = await ChatMessage.create({
-            paper: paperId,
-            user: userId,
-            content: question,
-            role: "user",
-        });
-
-        // Initialize contextData and track used functions
-        const usedFunctions = new Set();
-        let contextData = {};
-        let paperDetails = null; // Declare in outer scope
-
-        // Start with initial context gathering
-        try {
-            // First get paper details
-            paperDetails = await callFunctionByName(
-                "getPaperDetails",
-                paperId,
-                userId
-            );
-            contextData["getPaperDetails"] = paperDetails;
-            usedFunctions.add("getPaperDetails");
-
-            // Initial search
-            const initialSearchResult = await callFunctionByName(
-                "searchKnowledgeBase",
-                paperId,
-                userId,
-                { query: question }
-            );
-
-            // Fallback if no results
-            if (!initialSearchResult || initialSearchResult.length === 0) {
-                console.log("Initial search failed, trying individual terms");
-
-                // Use QUESTION variable instead of undefined 'query'
-                const queryTerms = question
-                    .trim()
-                    .split(/\s+/)
-                    .filter((term) => term.length > 0);
-
-                for (const term of queryTerms) {
-                    const termResults = await callFunctionByName(
-                        "searchKnowledgeBase",
-                        paperId,
-                        userId,
-                        { query: term }
-                    );
-                    if (termResults.length > 0) {
-                        contextData["searchKnowledgeBase"] = termResults;
-                        usedFunctions.add("searchKnowledgeBase");
-                        break;
-                    }
-                }
-            } else {
-                contextData["searchKnowledgeBase"] = initialSearchResult;
-                usedFunctions.add("searchKnowledgeBase");
-            }
-        } catch (preSearchErr) {
-            console.error("Initial context error:", preSearchErr);
-        }
-
-        // Build initial prompt with proper fallbacks
-        let initialPrompt = `${SYSTEM_PROMPT}\n\n`;
-
-        // Add paper details from contextData or direct paper object
-        if (contextData.getPaperDetails) {
-            initialPrompt += `Paper Details: ${JSON.stringify(contextData.getPaperDetails)}\n\n`;
-        } else {
-            initialPrompt += `Paper Title: ${paper.title}\nAbstract: ${paper.abstract}\n\n`;
-        }
-
-        // Add search context with fallback
-        if (contextData.searchKnowledgeBase?.length > 0) {
-            initialPrompt += `Relevant Context: ${JSON.stringify(contextData.searchKnowledgeBase)}\n\n`;
-        } else {
-            initialPrompt += `No relevant passages found. Using paper abstract:\n"${paper.abstract}"\n\n`;
-        }
-
-        initialPrompt += `My question is: ${question}\n\nPlease respond in JSON format with function_call if you need more info or final_answer if you can answer now.`;
-
-        // Rest of the original logic remains the same
-        const messageHistory = [{ role: "user", content: initialPrompt }];
-        let finalAnswer = null;
-        const MAX_TURNS = 5;
-        let turns = 0;
-
-        while (turns < MAX_TURNS) {
-            turns++;
-
-            const rawResponse = await generateChatResponse(messageHistory);
-            const parsed = parseGeminiResponse(rawResponse);
-            console.log("Gemini response (turn " + turns + "):", parsed);
-
-            // Handle tool calling
-            if (parsed.function_call?.name) {
-                const { name, parameters } = parsed.function_call;
-                let toolResult = null;
-
-                try {
-                    if (name === "getPaperDetails") {
-                        toolResult = await callFunctionByName(
-                            name,
-                            paperId,
-                            userId
-                        );
-                    } else if (name === "getChatHistory") {
-                        toolResult = await callFunctionByName(
-                            name,
-                            paperId,
-                            userId,
-                            { limit: 5 }
-                        );
-                    } else if (name === "searchKnowledgeBase") {
-                        toolResult = await callFunctionByName(
-                            name,
-                            paperId,
-                            userId,
-                            {
-                                query: parameters?.query || question,
-                            }
-                        );
-                    }
-
-                    console.log(`Tool result (${name}):`, toolResult);
-
-                    usedFunctions.add(name);
-                    contextData[name] = toolResult;
-
-                    // Add function response to message history
-                    messageHistory.push({
-                        role: "function",
-                        name: name,
-                        content: toolResult,
-                    });
-
-                    // Provide better guidance based on function call results
-                    if (name === "getPaperDetails") {
-                        messageHistory.push({
-                            role: "user",
-                            content:
-                                "Now that you have the paper details, please search for specific relevant information in the knowledge base. Use short, specific technical terms from the paper (like key concepts mentioned in the abstract or keywords) that would likely appear in explanatory passages.",
-                        });
-                    } else if (name === "searchKnowledgeBase") {
-                        if (!toolResult || toolResult.length === 0) {
-                            // If the search returned no results, try alternative searches
-                            // Extract paper details if available
-                            const paperDetails = contextData["getPaperDetails"];
-
-                            if (
-                                paperDetails &&
-                                paperDetails.keywords &&
-                                paperDetails.keywords.length > 0
-                            ) {
-                                // Suggest using keywords from the paper
-                                const keywordSuggestions = paperDetails.keywords
-                                    .slice(0, 3)
-                                    .join(", ");
-                                messageHistory.push({
-                                    role: "user",
-                                    content: `The search didn't return any results for "${parameters?.query || question}". Please try another search using more specific technical terms from the paper. Consider searching for these keywords from the paper: ${keywordSuggestions}, or try breaking down your query into smaller, more specific terms.`,
-                                });
-                            } else {
-                                // Generic fallback if no keywords available
-                                messageHistory.push({
-                                    role: "user",
-                                    content: `The search didn't return any results for "${parameters?.query || question}". Please try another search using different terms or concepts from the paper's abstract.`,
-                                });
-                            }
-                        } else {
-                            // Normal flow if search returned results
-                            messageHistory.push({
-                                role: "user",
-                                content:
-                                    "Based on these search results, please continue with any other function calls needed or provide your final answer. If these results don't fully answer the question, consider searching for additional relevant terms.",
-                            });
-                        }
-                    } else {
-                        // Default message for other function calls
-                        messageHistory.push({
-                            role: "user",
-                            content:
-                                "Now that you have the information from " +
-                                name +
-                                ", please continue with the next function call or provide your final answer.",
-                        });
-                    }
-                } catch (funcErr) {
-                    console.error(`Error calling function ${name}:`, funcErr);
-                    messageHistory.push({
-                        role: "user",
-                        content: `There was an error calling ${name}. Please try another approach or provide a final answer based on what you know.`,
-                    });
-                }
-            } else {
-                // No more function_call: it's the final answer
-                finalAnswer =
-                    parsed.final_answer || "I'm not sure how to answer that.";
-                break;
-            }
-
-            // If we've reached the final turn and still have no answer, force a final response
-            if (turns === MAX_TURNS - 1) {
-                messageHistory.push({
-                    role: "user",
-                    content:
-                        "Please provide your final answer based on the information you've gathered so far, even if it's incomplete.",
-                });
-            }
-        }
-
-        // Save assistant message
-        const assistantMessage = await ChatMessage.create({
-            paper: paperId,
-            user: userId,
-            content: finalAnswer,
-            role: "assistant",
-            metadata: {
-                functionsUsed: [...usedFunctions],
-                contextData: true,
-            },
-        });
-
-        res.json({
-            question: formatMessage(userMessage),
-            answer: formatMessage(assistantMessage),
-            context: contextData,
-        });
-    } catch (err) {
-        console.error("Full error details:", {
-            error: err,
-            paperId,
-            userId,
-            question,
-        });
-        throw new ApiError(500, "Chat processing failed", err);
-    }
 });
 
 export const getChatHistory = asyncHandler(async (req, res) => {
@@ -347,6 +193,10 @@ export const chatUploadPaper = asyncHandler(async (req, res) => {
             fileSize: file.size,
         });
 
+        // Clear caches for new paper
+        PAPER_CONTEXT_CACHE.delete(paper._id);
+        SEARCH_RESULT_CACHE.clear();
+
         // Update chat message with paper reference
         const updatedChat = await ChatMessage.findByIdAndUpdate(
             chatId,
@@ -373,32 +223,196 @@ export const chatUploadPaper = asyncHandler(async (req, res) => {
     }
 });
 
-// Helper functions
-function formatMessage(message) {
-    return {
-        id: message._id,
-        content: message.content,
-        role: message.role,
-        createdAt: message.createdAt,
-        metadata: message.metadata || {},
-    };
-}
+export const processChatMessage = asyncHandler(async (req, res) => {
+    const { paperId } = req.params;
+    const { question } = req.body;
+    const userId = req.user.id;
 
-function formatPaperResponse(paper) {
-    return {
-        id: paper._id,
-        title: paper.title,
-        abstract: paper.abstract,
-        keywords: paper.keywords,
-        createdAt: paper.createdAt,
-    };
-}
+    if (!question?.trim()) throw new ApiError(400, "Question is required");
 
-async function extractTextFromPDF(buffer) {
+    const paper = await Paper.findOne({ _id: paperId, user: userId });
+    if (!paper) throw new ApiError(403, "Unauthorized access");
+
     try {
-        const data = await pdfParse(buffer);
-        return data.text.replace(/\s+/g, " ").trim();
-    } catch (err) {
-        throw new ApiError(400, "Invalid PDF file");
+        // Save user message
+        const userMessage = await ChatMessage.create({
+            paper: paperId,
+            user: userId,
+            content: question,
+            role: "user",
+        });
+
+        // Context management
+        const context = {
+            data: {},
+            usedFunctions: new Set(),
+            apiCallsMade: 0,
+            MAX_API_CALLS: 3,
+            MAX_TURNS: 4,
+        };
+
+        // Initial context setup
+        try {
+            context.data.getPaperDetails = await callFunctionByName(
+                "getPaperDetails",
+                paperId,
+                userId
+            );
+            context.usedFunctions.add("getPaperDetails");
+
+            if (!context.data.searchKnowledgeBase) {
+                const initialResults = await callFunctionByName(
+                    "searchKnowledgeBase",
+                    paperId,
+                    userId,
+                    { query: question }
+                );
+
+                if (!initialResults?.length) {
+                    const terms = question.trim().split(/\s+/);
+                    for (const term of terms) {
+                        const termResults = await callFunctionByName(
+                            "searchKnowledgeBase",
+                            paperId,
+                            userId,
+                            { query: term }
+                        );
+                        if (termResults?.length) {
+                            context.data.searchKnowledgeBase = termResults;
+                            context.usedFunctions.add("searchKnowledgeBase");
+                            break;
+                        }
+                    }
+                } else {
+                    context.data.searchKnowledgeBase = initialResults;
+                    context.usedFunctions.add("searchKnowledgeBase");
+                }
+            }
+        } catch (contextError) {
+            console.error("Context initialization error:", contextError);
+        }
+
+        // Conversation loop
+        const messageHistory = [
+            {
+                role: "user",
+                content: buildInitialPrompt(paper, context.data, question),
+            },
+        ];
+
+        let finalAnswer = null;
+        let turns = 0;
+
+        while (turns < context.MAX_TURNS && !finalAnswer) {
+            turns++;
+
+            try {
+                const rawResponse = await generateChatResponse(messageHistory);
+                const parsed = parseGeminiResponse(rawResponse);
+                console.log(`Gemini response (turn ${turns}):`, parsed);
+
+                // Handle general conversations FIRST
+                if (
+                    parsed.final_answer?.content?.main_idea &&
+                    !parsed.function_call
+                ) {
+                    finalAnswer = formatFinalAnswer(parsed);
+                    break; // Exit loop for general responses
+                }
+
+                // Validate paper analysis responses
+                // const validationError = validateResponseStructure(parsed);
+                // if (validationError) {
+                //     messageHistory.push({
+                //         role: "user",
+                //         content: validationError,
+                //     });
+                //     continue;
+                // }
+
+                // Handle function calls
+                if (parsed.function_call?.name) {
+                    if (context.apiCallsMade >= context.MAX_API_CALLS) {
+                        messageHistory.push({
+                            role: "user",
+                            content:
+                                "Maximum research depth reached. Providing final answer now.",
+                        });
+                        finalAnswer = formatFinalAnswer(parsed);
+                        break;
+                    }
+
+                    const { name, parameters } = parsed.function_call;
+                    const toolResult = await handleFunctionCall(
+                        name,
+                        paperId,
+                        userId,
+                        parameters
+                    );
+
+                    context.usedFunctions.add(name);
+                    context.data[name] = toolResult;
+                    context.apiCallsMade++;
+
+                    messageHistory.push({
+                        role: "function",
+                        name: name,
+                        content: toolResult,
+                    });
+
+                    // Add context-aware guidance
+                    messageHistory.push({
+                        role: "user",
+                        content:
+                            name === "searchKnowledgeBase" &&
+                            !toolResult?.length
+                                ? `No results for "${parameters?.query || question}". Try different terms.`
+                                : "Analyze these results and provide a comprehensive answer.",
+                    });
+                } else {
+                    finalAnswer = formatFinalAnswer(parsed);
+                }
+            } catch (error) {
+                console.error(`Turn ${turns} error:`, error);
+                messageHistory.push({
+                    role: "user",
+                    content:
+                        "Please respond using only the allowed functions: " +
+                        "getPaperDetails, searchKnowledgeBase, getChatHistory",
+                });
+            }
+        }
+
+        // Final fallback
+        if (!finalAnswer) {
+            finalAnswer =
+                "Unable to generate a complete answer. Please try rephrasing your question.";
+        }
+
+        // Save and return response
+        const assistantMessage = await ChatMessage.create({
+            paper: paperId,
+            user: userId,
+            content: finalAnswer,
+            role: "assistant",
+            metadata: {
+                functionsUsed: [...context.usedFunctions],
+                contextData: context.data,
+            },
+        });
+
+        res.json({
+            question: formatMessage(userMessage),
+            answer: formatMessage(assistantMessage),
+            context: context.data,
+        });
+    } catch (error) {
+        console.error("Chat processing error:", {
+            error: error.message,
+            paperId,
+            userId,
+            question,
+        });
+        throw new ApiError(500, "Chat processing failed", error);
     }
-}
+});
