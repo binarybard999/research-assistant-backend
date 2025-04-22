@@ -6,6 +6,9 @@ import {
     generateChatResponse,
     parseGeminiResponse,
     callFunctionByName,
+    PAPER_CONTEXT_CACHE,
+    SEARCH_RESULT_CACHE,
+    memoryCache
 } from "../services/gemini.service.js";
 import asyncHandler from "../utils/asyncHandler.js";
 import { ApiError } from "../utils/ApiError.js";
@@ -79,8 +82,12 @@ const handleFunctionCall = async (name, paperId, userId, params) => {
 
 const validateResponseStructure = (parsed) => {
     // Allow empty evidence for general responses
-    if (parsed.final_answer?.content && parsed.final_answer.content.main_idea) {
-        return null;
+    if (
+        parsed.final_answer?.content &&
+        parsed.final_answer.content.main_idea &&
+        !parsed.thinking_process
+    ) {
+        return null; // General conversation format is valid
     }
 
     // For paper analysis questions
@@ -88,26 +95,64 @@ const validateResponseStructure = (parsed) => {
         return "Invalid format. Required: main_idea, thinking_process";
     }
 
-    return null;
+    const content = parsed.final_answer.content;
+
+    // Check for sufficient detail in main idea
+    if (!content.main_idea || content.main_idea.length < 50) {
+        return "Main idea must be at least 50 characters for detailed responses";
+    }
+
+    // Check for sufficient evidence points
+    if (
+        !Array.isArray(content.supporting_evidence) ||
+        content.supporting_evidence.length < 2
+    ) {
+        return "At least 2 detailed evidence points are required";
+    }
+
+    // Check for analysis depth
+    if (!content.critical_analysis || content.critical_analysis.length < 200) {
+        return "Critical analysis must be at least 200 characters for detailed responses";
+    }
+
+    return null; // Valid response structure
 };
 
 const formatFinalAnswer = (parsed) => {
     if (!parsed.final_answer?.content) return "Could not generate response";
 
-    const { main_idea, supporting_evidence, critical_analysis } =
-        parsed.final_answer.content;
-
-    // Detect general conversation format (aligned with system prompt)
-    if (main_idea && !parsed.function_call && !parsed.thinking_process) {
-        return main_idea;
+    // For general conversations
+    if (
+        parsed.final_answer?.content?.main_idea &&
+        !parsed.function_call &&
+        !parsed.thinking_process
+    ) {
+        return parsed.final_answer.content.main_idea;
     }
 
-    // Paper analysis format
-    return (
-        `Main Idea: ${main_idea || "Not specified"}\n\n` +
-        `Evidence:\n${(supporting_evidence || []).join("\n")}\n\n` +
-        `Analysis: ${critical_analysis || "No analysis provided"}`
-    );
+    // Extract content components with validation to ensure nothing is lost
+    const content = parsed.final_answer.content || {};
+    const mainIdea = content.main_idea || "No main idea provided";
+    const evidence = Array.isArray(content.supporting_evidence)
+        ? content.supporting_evidence
+        : [content.supporting_evidence].filter(Boolean);
+    const analysis = content.critical_analysis || "";
+
+    // Full detailed formatting
+    let detailedResponse = `${mainIdea}\n\n`;
+
+    if (evidence.length > 0) {
+        detailedResponse += `## Key Evidence from Paper\n\n`;
+        evidence.forEach((point, i) => {
+            detailedResponse += `### Point ${i + 1}\n${point}\n\n`;
+        });
+    }
+
+    if (analysis) {
+        detailedResponse += `## Expert Analysis\n\n${analysis}`;
+    }
+
+    return detailedResponse;
 };
 
 // Controller functions
@@ -242,25 +287,47 @@ export const processChatMessage = asyncHandler(async (req, res) => {
             role: "user",
         });
 
-        // Context management
+        // Context management with improved caching
         const context = {
             data: {},
             usedFunctions: new Set(),
             apiCallsMade: 0,
             MAX_API_CALLS: 3,
             MAX_TURNS: 4,
+            cacheHits: 0,
         };
 
-        // Initial context setup
-        try {
-            context.data.getPaperDetails = await callFunctionByName(
-                "getPaperDetails",
-                paperId,
-                userId
-            );
-            context.usedFunctions.add("getPaperDetails");
+        // Check global cache first
+        const cacheKey = `${userId}:${paperId}`;
+        const cachedData = memoryCache.get(cacheKey) || {};
 
-            if (!context.data.searchKnowledgeBase) {
+        // Initial context setup with cache awareness
+        try {
+            // Check if paper details already in cache
+            if (PAPER_CONTEXT_CACHE.has(paperId)) {
+                context.data.getPaperDetails = PAPER_CONTEXT_CACHE.get(paperId);
+                context.usedFunctions.add("getPaperDetails");
+                context.cacheHits++;
+                console.log("Cache hit: getPaperDetails");
+            } else {
+                context.data.getPaperDetails = await callFunctionByName(
+                    "getPaperDetails",
+                    paperId,
+                    userId
+                );
+                context.usedFunctions.add("getPaperDetails");
+                // Cache is handled inside callFunctionByName
+            }
+
+            // Optimize search by checking cache first
+            const queryKey = `${paperId}-${question}`;
+            if (SEARCH_RESULT_CACHE.has(queryKey)) {
+                context.data.searchKnowledgeBase =
+                    SEARCH_RESULT_CACHE.get(queryKey);
+                context.usedFunctions.add("searchKnowledgeBase");
+                context.cacheHits++;
+                console.log("Cache hit: searchKnowledgeBase for", question);
+            } else {
                 const initialResults = await callFunctionByName(
                     "searchKnowledgeBase",
                     paperId,
@@ -269,8 +336,27 @@ export const processChatMessage = asyncHandler(async (req, res) => {
                 );
 
                 if (!initialResults?.length) {
-                    const terms = question.trim().split(/\s+/);
+                    // Split search only if main search failed
+                    const terms = question
+                        .trim()
+                        .split(/\s+/)
+                        .filter((t) => t.length > 3);
                     for (const term of terms) {
+                        const termQueryKey = `${paperId}-${term}`;
+
+                        // Check cache for individual terms
+                        if (SEARCH_RESULT_CACHE.has(termQueryKey)) {
+                            context.data.searchKnowledgeBase =
+                                SEARCH_RESULT_CACHE.get(termQueryKey);
+                            context.usedFunctions.add("searchKnowledgeBase");
+                            context.cacheHits++;
+                            console.log(
+                                "Cache hit: searchKnowledgeBase for term",
+                                term
+                            );
+                            break;
+                        }
+
                         const termResults = await callFunctionByName(
                             "searchKnowledgeBase",
                             paperId,
@@ -321,14 +407,14 @@ export const processChatMessage = asyncHandler(async (req, res) => {
                 }
 
                 // Validate paper analysis responses
-                // const validationError = validateResponseStructure(parsed);
-                // if (validationError) {
-                //     messageHistory.push({
-                //         role: "user",
-                //         content: validationError,
-                //     });
-                //     continue;
-                // }
+                const validationError = validateResponseStructure(parsed);
+                if (validationError) {
+                    messageHistory.push({
+                        role: "user",
+                        content: validationError,
+                    });
+                    continue;
+                }
 
                 // Handle function calls
                 if (parsed.function_call?.name) {
@@ -349,6 +435,7 @@ export const processChatMessage = asyncHandler(async (req, res) => {
                         userId,
                         parameters
                     );
+                    console.log(`Tool result for ${name}:`, toolResult);
 
                     context.usedFunctions.add(name);
                     context.data[name] = toolResult;
@@ -367,8 +454,9 @@ export const processChatMessage = asyncHandler(async (req, res) => {
                             name === "searchKnowledgeBase" &&
                             !toolResult?.length
                                 ? `No results for "${parameters?.query || question}". Try different terms.`
-                                : "Analyze these results and provide a comprehensive answer.",
+                                : "Analyze these results and provide a answer in very detail.",
                     });
+                    // console.log("Message history:", messageHistory);
                 } else {
                     finalAnswer = formatFinalAnswer(parsed);
                 }
@@ -399,6 +487,13 @@ export const processChatMessage = asyncHandler(async (req, res) => {
                 functionsUsed: [...context.usedFunctions],
                 contextData: context.data,
             },
+        });
+
+        console.log("Chat processing metrics:", {
+            cacheHits: context.cacheHits,
+            apiCallsMade: context.apiCallsMade,
+            turns: turns,
+            functionsCalled: [...context.usedFunctions],
         });
 
         res.json({
