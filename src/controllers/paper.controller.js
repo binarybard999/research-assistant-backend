@@ -17,7 +17,6 @@ export async function extractTextFromPDF(buffer) {
         const extracted = normalizeText(data.text);
 
         if (!extracted || extracted.length < 20) {
-            // Could be image-only or blank PDF
             console.warn("⚠️ PDF appears to contain no extractable text.");
             throw new ApiError(400, "PDF contains no readable text");
         }
@@ -27,6 +26,123 @@ export async function extractTextFromPDF(buffer) {
         console.error("❌ PDF parsing failed:", err.message);
         throw new ApiError(400, "Invalid or unreadable PDF file");
     }
+}
+
+// Chunking with text segmentation
+function chunkTextBySections(text, fallbackChunkSize = 3000) {
+    // Try to detect sections using regex patterns for common section headers
+    const sectionPatterns = [
+        /\n\s*(?:ABSTRACT|Abstract|abstract)\s*[:.\n]/,
+        /\n\s*(?:INTRODUCTION|Introduction|introduction)\s*[:.\n]/,
+        /\n\s*(?:METHODS?|Methods?|METHODOLOGY|Methodology)\s*[:.\n]/,
+        /\n\s*(?:RESULTS?|Results?)\s*[:.\n]/,
+        /\n\s*(?:DISCUSSION|Discussion)\s*[:.\n]/,
+        /\n\s*(?:CONCLUSION|Conclusion)s?\s*[:.\n]/,
+        /\n\s*(?:REFERENCES|References|BIBLIOGRAPHY|Bibliography)\s*[:.\n]/,
+        /\n\s*(?:\d+\.|\d+\s+)[A-Z][^.!?]*[:.\n]/g, // Numbered sections
+    ];
+
+    // Find potential section breaks
+    let sectionBreaks = [];
+
+    // Collect all section breaks
+    sectionPatterns.forEach((pattern) => {
+        let match;
+        if (pattern.global) {
+            while ((match = pattern.exec(text)) !== null) {
+                sectionBreaks.push(match.index);
+            }
+        } else {
+            match = text.match(pattern);
+            if (match) sectionBreaks.push(match.index);
+        }
+    });
+
+    // Add start and end positions
+    sectionBreaks.push(0);
+    sectionBreaks.push(text.length);
+
+    // Sort and deduplicate section breaks
+    sectionBreaks = [...new Set(sectionBreaks)].sort((a, b) => a - b);
+
+    // Extract chunks based on section breaks
+    const chunks = [];
+
+    console.log(
+        `Found ${sectionBreaks.length - 1} potential sections in the document`
+    );
+
+    for (let i = 0; i < sectionBreaks.length - 1; i++) {
+        const start = sectionBreaks[i];
+        const end = sectionBreaks[i + 1];
+        const section = text.substring(start, end).trim();
+
+        // Skip empty or too small sections
+        if (section.length < 50) continue;
+
+        // IMPORTANT: For very large sections, always split into smaller chunks
+        if (section.length > fallbackChunkSize) {
+            const subChunks = chunkTextBySize(section, fallbackChunkSize);
+            chunks.push(...subChunks);
+            console.log(
+                `Split large section (${section.length} chars) into ${subChunks.length} chunks`
+            );
+        } else {
+            chunks.push(section);
+        }
+    }
+
+    // CRITICAL: If we got no chunks or just one huge chunk, force chunking by size
+    if (chunks.length <= 1) {
+        console.log(
+            `Section detection produced ${chunks.length} chunks. Falling back to size-based chunking.`
+        );
+        return chunkTextBySize(text, fallbackChunkSize);
+    }
+
+    console.log(
+        `Successfully created ${chunks.length} chunks by section detection`
+    );
+    return chunks;
+}
+
+function chunkTextBySize(text, chunkSize = 3000) {
+    // Try to split at paragraph breaks for more natural chunks
+    const paragraphs = text.split(/\n\s*\n/);
+    const chunks = [];
+    let currentChunk = "";
+
+    for (const paragraph of paragraphs) {
+        // If adding this paragraph would exceed the chunk size and we already have content
+        if (
+            currentChunk.length + paragraph.length > chunkSize &&
+            currentChunk.length > 0
+        ) {
+            chunks.push(currentChunk.trim());
+            currentChunk = paragraph;
+        } else {
+            currentChunk += (currentChunk ? "\n\n" : "") + paragraph;
+        }
+    }
+
+    // Don't forget the last chunk
+    if (currentChunk) {
+        chunks.push(currentChunk.trim());
+    }
+
+    // Fallback: If we still have no chunks or just one huge chunk, use mechanical approach
+    if (chunks.length <= 1 && text.length > chunkSize) {
+        console.log("Falling back to mechanical chunking by character count");
+        return Array.from(
+            { length: Math.ceil(text.length / chunkSize) },
+            (_, i) => text.slice(i * chunkSize, (i + 1) * chunkSize).trim()
+        );
+    }
+
+    console.log(
+        `Created ${chunks.length} chunks by paragraph-aware size splitting`
+    );
+    return chunks;
 }
 
 async function removeFile(filePath) {
@@ -168,64 +284,94 @@ export const uploadPapers = asyncHandler(async (req, res) => {
     }
 });
 
-// Enhanced processing with progress tracking
+// Processing with hierarchical structure
 async function processSinglePaper(file, user, metadata) {
     let paper;
 
     try {
-        // ✅ Read file from disk safely
+        // Read file from disk safely
         const absolutePath = path.resolve(file.path);
         const buffer = await fs.readFile(absolutePath);
 
-        // ✅ Extract and validate text
+        // Extract and validate text
         const text = await extractTextFromPDF(buffer);
-        const chunks = chunkText(text); // Creating chunks for semantic search
 
-        // ✅ Create paper and placeholder KB
-        const [createdPaper] = await Promise.all([
-            Paper.create({
-                title: metadata.title || path.parse(file.originalname).name,
-                authors: metadata.authors || "",
-                abstract: metadata.abstract || "",
-                content: text,
-                user: user._id,
-                fileSize: file.size,
-                processingStatus: "analyzing",
-            }),
-            KnowledgeBase.create({
-                paper: null, // update later
-                aggregatedSummary: "Analysis in progress...",
-                aggregatedKeywords: [],
-                chunks: chunks.map((text) => ({ text })), // each chunk in an object
-            }),
-        ]);
+        // Ensure creating multiple chunks
+        const chunks = chunkTextBySections(text);
+
+        console.log(
+            `Created ${chunks.length} chunks from PDF. Chunk sizes: ${chunks.map((c) => c.length).join(", ")}`
+        );
+
+        // Validate that chunking worked - if not, force rechunking
+        if (chunks.length === 1 && text.length > 5000) {
+            console.log(
+                "Warning: Only one chunk created. Forcing size-based chunking."
+            );
+            chunks = chunkTextBySize(text, 3000);
+        }
+
+        // Create paper and placeholder KB
+        const knowledgeBase = await KnowledgeBase.create({
+            paper: null, // update later
+            aggregatedSummary: "Analysis in progress...",
+            aggregatedKeywords: [],
+            chunks: chunks.map((text) => ({
+                text,
+                summary: "", // Will be filled in later
+                keywords: [],
+            })),
+            hierarchicalSummary: {
+                overview: "Processing in progress...",
+                sections: [],
+            },
+        });
+
+        const createdPaper = await Paper.create({
+            title: metadata.title || path.parse(file.originalname).name,
+            authors: metadata.authors || "",
+            abstract: metadata.abstract || "",
+            content:
+                text.substring(0, 5000) + (text.length > 5000 ? "..." : ""), // Only store a preview in the paper
+            user: user._id,
+            fileSize: file.size,
+            processingStatus: "analyzing",
+            knowledgeBase: knowledgeBase._id, // Link to KB immediately
+        });
 
         paper = createdPaper;
 
-        // ✅ Update KB with paper ref
-        await KnowledgeBase.updateOne({ paper: null }, { paper: paper._id });
+        // Update KB with paper ref
+        await KnowledgeBase.findByIdAndUpdate(knowledgeBase._id, {
+            paper: paper._id,
+        });
 
-        // ✅ Process with Gemini
-        const { aggregatedSummary, keywordsArray } =
+        // Update progress to 20%
+        await Paper.updateOne(
+            { _id: paper._id },
+            { $set: { processingProgress: 20 } }
+        );
+
+        // Process with Gemini - make sure to pass ALL chunks
+        const { aggregatedSummary, keywordsArray, hierarchicalSummary } =
             await processChunksWithGemini(chunks, user, paper);
 
-        // ✅ Final updates
+        // Final updates with hierarchical summary
         await Promise.all([
             Paper.findByIdAndUpdate(paper._id, {
                 summary: aggregatedSummary,
                 keywords: keywordsArray,
                 processingStatus: "completed",
+                processingProgress: 100,
             }),
-            KnowledgeBase.findOneAndUpdate(
-                { paper: paper._id },
-                {
-                    aggregatedSummary,
-                    aggregatedKeywords: keywordsArray,
-                }
-            ),
+            KnowledgeBase.findByIdAndUpdate(knowledgeBase._id, {
+                aggregatedSummary,
+                aggregatedKeywords: keywordsArray,
+                hierarchicalSummary,
+            }),
         ]);
 
-        // ✅ Return paper with populated KB
+        // Return paper with populated KB
         return {
             paper: await Paper.findById(paper._id)
                 .populate("knowledgeBase")
@@ -259,40 +405,133 @@ async function processSinglePaper(file, user, metadata) {
     }
 }
 
-// Helper functions
+// Processing function with hierarchical organization
 async function processChunksWithGemini(chunks, user, paper) {
-    const result = await geminiService.analyzePaperChunks(
-        chunks,
-        null, // no previous summary initially
-        user.tier
-    );
+    // IMPORTANT: Process chunks in smaller batches
+    const batchSize = 2; // Process 2 chunks at a time
+    const chunkResults = [];
+    let progress = 20;
+    const progressStep = 50 / chunks.length; // 50% progress dedicated to chunk analysis
 
-    if (!result || !Array.isArray(result.summaries)) {
-        throw new Error("Gemini analysis failed or returned invalid data.");
+    console.log(`Processing ${chunks.length} chunks with Gemini...`);
+
+    // Process chunks in batches
+    for (let i = 0; i < chunks.length; i += batchSize) {
+        // Get current batch of chunks
+        const batch = chunks.slice(i, Math.min(i + batchSize, chunks.length));
+
+        console.log(
+            `Processing batch ${Math.floor(i / batchSize) + 1}, chunks ${i + 1}-${i + batch.length} of ${chunks.length}`
+        );
+
+        // Process this batch
+        const batchResults = await geminiService.analyzePaperChunks(
+            batch,
+            i > 0 ? chunkResults[i - 1]?.summary : null,
+            user.tier
+        );
+
+        // Store results for each chunk in this batch
+        for (let j = 0; j < batch.length; j++) {
+            const chunkIndex = i + j;
+            if (batchResults.summaries[j]) {
+                chunkResults[chunkIndex] = {
+                    text: chunks[chunkIndex],
+                    summary: batchResults.summaries[j].summary || "",
+                    keywords: batchResults.summaries[j].keywords || [],
+                };
+
+                // Update each chunk in the knowledge base as we process them
+                await KnowledgeBase.updateOne(
+                    { paper: paper._id, "chunks.text": chunks[chunkIndex] },
+                    {
+                        $set: {
+                            "chunks.$.summary":
+                                batchResults.summaries[j].summary || "",
+                            "chunks.$.keywords":
+                                batchResults.summaries[j].keywords || [],
+                        },
+                    }
+                );
+            }
+        }
+
+        // Update processing progress
+        progress += progressStep * batch.length;
+        await Paper.updateOne(
+            { _id: paper._id },
+            { $set: { processingProgress: Math.min(70, Math.round(progress)) } }
+        );
+
+        // Add a small delay between batches to avoid rate limiting
+        if (i + batchSize < chunks.length) {
+            await new Promise((resolve) => setTimeout(resolve, 1000));
+        }
     }
 
-    // Optional: store progress as 100% complete
+    // Update progress to 70%
     await Paper.updateOne(
         { _id: paper._id },
-        {
-            $set: {
-                processingProgress: 100,
-            },
-        }
+        { $set: { processingProgress: 70 } }
     );
+
+    // Collect all summaries and keywords
+    const allSummaries = chunkResults
+        .map((r) => r.summary)
+        .filter(Boolean)
+        .join("\n\n");
+    const allKeywords = Array.from(
+        new Set(chunkResults.flatMap((r) => r.keywords).filter(Boolean))
+    );
+
+    console.log(
+        `Generated ${allSummaries.length} chars of summary content from all chunks`
+    );
+
+    // Generate hierarchical structure with improved error handling
+    let hierarchicalSummary;
+    try {
+        const hierarchicalResponse =
+            await geminiService.generateHierarchicalSummary(allSummaries);
+        hierarchicalSummary = hierarchicalResponse;
+    } catch (err) {
+        console.error("Failed to generate hierarchical summary:", err);
+        // Fallback to simpler structure
+        hierarchicalSummary = {
+            overview:
+                allSummaries.length > 1000
+                    ? allSummaries.substring(0, 1000) + "..."
+                    : allSummaries,
+            sections: [],
+        };
+    }
+
+    // Update progress to 90%
+    await Paper.updateOne(
+        { _id: paper._id },
+        { $set: { processingProgress: 90 } }
+    );
+
+    // Create final aggregate summary
+    let aggregatedSummary;
+    try {
+        aggregatedSummary = await geminiService.refineSummary(
+            hierarchicalSummary.overview || allSummaries
+        );
+    } catch (err) {
+        console.error("Failed to refine summary:", err);
+        aggregatedSummary =
+            hierarchicalSummary.overview ||
+            (allSummaries.length > 500
+                ? allSummaries.substring(0, 500) + "..."
+                : allSummaries);
+    }
 
     return {
-        aggregatedSummary: await geminiService.refineSummary(
-            result.aggregatedSummary
-        ),
-        keywordsArray: result.keywordsArray,
+        aggregatedSummary,
+        keywordsArray: allKeywords.slice(0, 20), // Limit to top 20 keywords
+        hierarchicalSummary,
     };
-}
-
-function chunkText(text, chunkSize = 5000) {
-    return Array.from({ length: Math.ceil(text.length / chunkSize) }, (_, i) =>
-        text.slice(i * chunkSize, (i + 1) * chunkSize)
-    );
 }
 
 function formatPaperResponse(paper, textLength = null, chunkCount = null) {
@@ -306,19 +545,8 @@ function formatPaperResponse(paper, textLength = null, chunkCount = null) {
         keywords: (paper.keywords || []).slice(0, 10),
         originalTextLength: textLength || paper.content?.length || 0,
         normalizedTextLength: paper.content?.length || 0,
-        chunksProcessed: chunkCount || 0,
+        chunksProcessed: chunkCount || paper.knowledgeBase?.chunks?.length || 0,
         createdAt: paper.createdAt,
-    };
-}
-
-function formatBatchResponse(results) {
-    return {
-        success: results.filter((r) => r.status === "fulfilled").length,
-        failed: results.filter((r) => r.status === "rejected").length,
-        papers: results.map((r) =>
-            r.value?.paper ? formatPaperResponse(r.value.paper) : null
-        ),
-        errors: results.map((r) => r.reason?.message || "Unknown error"),
     };
 }
 
@@ -326,19 +554,21 @@ export const getPapers = asyncHandler(async (req, res) => {
     const papers = await Paper.find({ user: req.user.id })
         .populate({
             path: "knowledgeBase",
-            select: "aggregatedSummary aggregatedKeywords",
+            select: "aggregatedSummary aggregatedKeywords hierarchicalSummary",
         })
-        .select("title authors abstract createdAt keywords knowledgeBase summary")
+        .select(
+            "title authors abstract createdAt keywords knowledgeBase summary processingStatus processingProgress"
+        )
         .lean();
-
-    console.log(papers);
 
     res.json(
         papers.map((paper) => ({
             ...paper,
             // Flatten the knowledgeBase data
-            summary: paper.knowledgeBase?.aggregatedSummary || paper.summary || "",
+            summary:
+                paper.knowledgeBase?.aggregatedSummary || paper.summary || "",
             keywords: paper.knowledgeBase?.aggregatedKeywords || paper.keywords,
+            hierarchicalSummary: paper.knowledgeBase?.hierarchicalSummary,
             // Remove the nested knowledgeBase if needed
             knowledgeBase: undefined,
         }))
@@ -364,7 +594,10 @@ export const getPaperById = asyncHandler(async (req, res) => {
             aggregatedSummary: "",
             aggregatedKeywords: [],
             chunks: [],
-            hierarchicalSummary: {},
+            hierarchicalSummary: {
+                overview: "",
+                sections: [],
+            },
         },
     });
 });
