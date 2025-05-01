@@ -8,6 +8,8 @@ import asyncHandler from "../utils/asyncHandler.js";
 import { ApiError } from "../utils/ApiError.js";
 import ChatMessage from "../models/chatMessage.model.js";
 import geminiService from "../services/gemini.service.js";
+import { logActivity } from "./activity.controller.js";
+import mongoose from "mongoose";
 
 const normalizeText = (text) => text.replace(/\s+/g, " ").trim();
 
@@ -617,3 +619,310 @@ export const deletePaper = asyncHandler(async (req, res) => {
 
     res.json({ message: "Paper and associated data deleted successfully" });
 });
+
+// Library Functions
+// Toggle paper favorite status
+export const toggleFavorite = async (req, res) => {
+    try {
+        const { id } = req.params;
+
+        const paper = await Paper.findOne({ _id: id, user: req.user.id });
+        if (!paper) {
+            return res.status(404).json({ message: "Paper not found" });
+        }
+
+        if (!paper.metadata) paper.metadata = {};
+        const isFavorite = !paper.metadata.isFavorite;
+        paper.metadata.isFavorite = isFavorite;
+        await paper.save();
+
+        // Log activity
+        await logActivity(
+            req.user.id,
+            isFavorite ? "favorited_paper" : "unfavorited_paper",
+            paper._id
+        );
+
+        res.json({ isFavorite });
+    } catch (error) {
+        res.status(500).json({
+            message: "Error toggling favorite status",
+            error: error.message,
+        });
+    }
+};
+
+// Add annotation to paper
+export const addAnnotation = async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { content, page, contextSnippet } = req.body;
+
+        if (!content) {
+            return res
+                .status(400)
+                .json({ message: "Annotation content is required" });
+        }
+
+        const paper = await Paper.findOne({ _id: id, user: req.user.id });
+        if (!paper) {
+            return res.status(404).json({ message: "Paper not found" });
+        }
+
+        const annotation = {
+            content,
+            page: page || 1,
+            contextSnippet: contextSnippet || "",
+            createdBy: req.user.id,
+            createdAt: new Date(),
+        };
+
+        paper.annotations.push(annotation);
+        await paper.save();
+
+        // Log activity
+        await logActivity(req.user.id, "added_annotation", paper._id, null, {
+            page,
+        });
+
+        res.status(201).json(annotation);
+    } catch (error) {
+        res.status(500).json({
+            message: "Error adding annotation",
+            error: error.message,
+        });
+    }
+};
+
+// Get annotations for a paper
+export const getAnnotations = async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { page } = req.query;
+
+        const paper = await Paper.findOne({ _id: id, user: req.user.id });
+        if (!paper) {
+            return res.status(404).json({ message: "Paper not found" });
+        }
+
+        let annotations = paper.annotations;
+
+        // Filter by page if specified
+        if (page) {
+            annotations = annotations.filter((a) => a.page === parseInt(page));
+        }
+
+        res.json(annotations);
+    } catch (error) {
+        res.status(500).json({
+            message: "Error getting annotations",
+            error: error.message,
+        });
+    }
+};
+
+// Delete annotation
+export const deleteAnnotation = async (req, res) => {
+    try {
+        const { id, annotationId } = req.params;
+
+        const paper = await Paper.findOne({ _id: id, user: req.user.id });
+        if (!paper) {
+            return res.status(404).json({ message: "Paper not found" });
+        }
+
+        const annotationIndex = paper.annotations.findIndex(
+            (a) => a._id.toString() === annotationId
+        );
+
+        if (annotationIndex === -1) {
+            return res.status(404).json({ message: "Annotation not found" });
+        }
+
+        // Remove the annotation
+        paper.annotations.splice(annotationIndex, 1);
+        await paper.save();
+
+        // Log activity
+        await logActivity(req.user.id, "removed_annotation", paper._id);
+
+        res.json({ message: "Annotation deleted" });
+    } catch (error) {
+        res.status(500).json({
+            message: "Error deleting annotation",
+            error: error.message,
+        });
+    }
+};
+
+// Update paper metadata
+export const updatePaperMetadata = async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { title, authors, abstract, keywords } = req.body;
+
+        const paper = await Paper.findOne({ _id: id, user: req.user.id });
+        if (!paper) {
+            return res.status(404).json({ message: "Paper not found" });
+        }
+
+        // Update fields if provided
+        if (title) paper.title = title;
+        if (authors) paper.authors = authors;
+        if (abstract) paper.abstract = abstract;
+        if (keywords) paper.keywords = keywords;
+
+        await paper.save();
+
+        // Log activity
+        await logActivity(req.user.id, "edited_paper_metadata", paper._id);
+
+        res.json(paper);
+    } catch (error) {
+        res.status(500).json({
+            message: "Error updating paper metadata",
+            error: error.message,
+        });
+    }
+};
+
+// Delete paper
+// export const deletePaper = async (req, res) => {
+//     try {
+//         const { id } = req.params;
+
+//         const paper = await Paper.findOne({ _id: id, user: req.user.id });
+//         if (!paper) {
+//             return res.status(404).json({ message: "Paper not found" });
+//         }
+
+//         const session = await mongoose.startSession();
+//         session.startTransaction();
+
+//         try {
+//             // Delete associated knowledge base
+//             if (paper.knowledgeBase) {
+//                 await KnowledgeBase.findByIdAndDelete(paper.knowledgeBase, { session });
+//             }
+
+//             // Delete the paper
+//             await Paper.findByIdAndDelete(id, { session });
+
+//             // Delete the file if it exists
+//             if (paper.metadata && paper.metadata.fileName) {
+//                 const filePath = `${process.env.UPLOADS_PATH || './uploads'}/${id}`;
+//                 if (fs.existsSync(filePath)) {
+//                     fs.unlinkSync(filePath);
+//                 }
+//             }
+
+//             await session.commitTransaction();
+//             session.endSession();
+
+//             // Log activity
+//             await logActivity(req.user.id, "deleted_paper", null, null, {
+//                 paperTitle: paper.title,
+//                 paperId: paper._id.toString()
+//             });
+
+//             res.json({ message: "Paper deleted successfully" });
+//         } catch (error) {
+//             await session.abortTransaction();
+//             session.endSession();
+//             throw error;
+//         }
+//     } catch (error) {
+//         res.status(500).json({ message: "Error deleting paper", error: error.message });
+//     }
+// };
+
+// Get citations for a paper
+export const getPaperCitations = async (req, res) => {
+    try {
+        const { id } = req.params;
+
+        const paper = await Paper.findOne({ _id: id, user: req.user.id });
+        if (!paper) {
+            return res.status(404).json({ message: "Paper not found" });
+        }
+
+        res.json(paper.citations || []);
+    } catch (error) {
+        res.status(500).json({
+            message: "Error getting citations",
+            error: error.message,
+        });
+    }
+};
+
+// Add citation to paper
+export const addCitation = async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { title, authors, source, year, doi } = req.body;
+
+        if (!title) {
+            return res
+                .status(400)
+                .json({ message: "Citation title is required" });
+        }
+
+        const paper = await Paper.findOne({ _id: id, user: req.user.id });
+        if (!paper) {
+            return res.status(404).json({ message: "Paper not found" });
+        }
+
+        const citation = {
+            title,
+            authors: Array.isArray(authors)
+                ? authors
+                : authors
+                  ? [authors]
+                  : [],
+            source: source || "",
+            year: year || null,
+            doi: doi || "",
+        };
+
+        if (!paper.citations) paper.citations = [];
+        paper.citations.push(citation);
+        await paper.save();
+
+        res.status(201).json(citation);
+    } catch (error) {
+        res.status(500).json({
+            message: "Error adding citation",
+            error: error.message,
+        });
+    }
+};
+
+// Delete citation
+export const deleteCitation = async (req, res) => {
+    try {
+        const { id, citationId } = req.params;
+
+        const paper = await Paper.findOne({ _id: id, user: req.user.id });
+        if (!paper) {
+            return res.status(404).json({ message: "Paper not found" });
+        }
+
+        const citationIndex = paper.citations.findIndex(
+            (c) => c._id.toString() === citationId
+        );
+
+        if (citationIndex === -1) {
+            return res.status(404).json({ message: "Citation not found" });
+        }
+
+        paper.citations.splice(citationIndex, 1);
+        await paper.save();
+
+        res.json({ message: "Citation deleted" });
+    } catch (error) {
+        res.status(500).json({
+            message: "Error deleting citation",
+            error: error.message,
+        });
+    }
+};

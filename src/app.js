@@ -47,6 +47,9 @@ import paperRouter from "./routes/paper.routes.js";
 import knowledgeBaseRouter from "./routes/knowledgeBase.routes.js";
 import userRouter from "./routes/user.routes.js";
 import paperChatRoutes from "./routes/paperChat.routes.js";
+import libraryRouter from "./routes/library.routes.js";
+import readingListRouter from "./routes/readingList.routes.js";
+import activityRouter from "./routes/activity.routes.js";
 
 // Routes Middleware
 // Auth limiter to login routes if needed
@@ -55,6 +58,9 @@ app.use("/api/v1/users", userRouter);
 app.use("/api/v1/papers", paperRouter);
 app.use("/api/v1/knowledge-base", knowledgeBaseRouter);
 app.use("/api/v1/paper-chat", paperChatRoutes);
+app.use("/api/v1/library", libraryRouter);
+app.use("/api/v1/reading-lists", readingListRouter);
+app.use("/api/v1/activity", activityRouter);
 
 // Root route
 app.get("/", (req, res) => {
