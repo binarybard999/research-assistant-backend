@@ -53,23 +53,49 @@ export const createList = async (req, res) => {
 // Add paper to reading list
 export const addToList = async (req, res) => {
     try {
-        const { listId, paperIds } = req.body; // Accepts array of paper IDs
+        const { listId, paperIds } = req.body;
+
+        // Validate input
+        if (!Array.isArray(paperIds)) {
+            return res
+                .status(400)
+                .json({ message: "paperIds must be an array" });
+        }
 
         const list = await ReadingList.findOne({
             _id: listId,
+            $or: [
+                { user: req.user.id },
+                {
+                    "collaborators.user": req.user.id,
+                    "collaborators.role": "editor",
+                },
+            ],
+        }).populate("papers");
+
+        // Check paper ownership
+        const papers = await Paper.find({
+            _id: { $in: paperIds },
             user: req.user.id,
         });
 
-        // Add all papers at once
-        const newPapers = paperIds.filter(
-            (paperId) => !list.papers.includes(paperId)
+        if (papers.length !== paperIds.length) {
+            return res
+                .status(403)
+                .json({ message: "Unauthorized access to some papers" });
+        }
+
+        // Add only new papers
+        const existingPapers = new Set(
+            list.papers.map((p) => p._id.toString())
         );
+        const newPapers = paperIds.filter((id) => !existingPapers.has(id));
 
         list.papers.push(...newPapers);
         await list.save();
 
         await logActivity(req.user.id, "added_to_reading_list", null);
-        res.json(list);
+        res.json(await list.populate("papers", "title authors abstract"));
     } catch (error) {
         res.status(500).json({
             message: "Error adding papers to reading list",
@@ -177,28 +203,28 @@ export const addCollaborator = async (req, res) => {
 
         const list = await ReadingList.findOne({
             _id: listId,
-            user: req.user.id,
+            user: req.user.id, // Only owner can add collaborators
         });
-        if (!list)
-            return res.status(404).json({ message: "Reading list not found" });
 
-        // Check if user is already a collaborator
-        const existingCollaborator = list.collaborators.find(
+        // Validate user exists
+        const userExists = await User.exists({ _id: userId });
+        if (!userExists) {
+            return res.status(404).json({ message: "User not found" });
+        }
+
+        // Prevent duplicate collaborators
+        const existingIndex = list.collaborators.findIndex(
             (c) => c.user.toString() === userId
         );
-        if (existingCollaborator) {
-            existingCollaborator.role = role;
+
+        if (existingIndex > -1) {
+            list.collaborators[existingIndex].role = role;
         } else {
             list.collaborators.push({ user: userId, role });
         }
 
         await list.save();
-        await logActivity(
-            req.user.id,
-            "added_collaborator_to_reading_list",
-            null
-        );
-        res.json(list);
+        res.json(await list.populate("collaborators.user", "name email"));
     } catch (error) {
         res.status(500).json({
             message: "Error adding collaborator",

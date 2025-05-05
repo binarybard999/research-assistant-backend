@@ -45,6 +45,7 @@ const PaperSchema = new mongoose.Schema(
             fileName: String,
             mimeType: String,
             sizeInKB: Number,
+            isFavorite: { type: Boolean, default: false },
         },
     },
     { timestamps: true }
