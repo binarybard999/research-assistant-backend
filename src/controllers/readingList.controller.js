@@ -73,7 +73,11 @@ export const addToList = async (req, res) => {
             ],
         }).populate("papers");
 
-        // Check paper ownership
+        if (!list) {
+            return res.status(404).json({ message: "Reading list not found" });
+        }
+
+        // Check paper ownership and get paper details
         const papers = await Paper.find({
             _id: { $in: paperIds },
             user: req.user.id,
@@ -89,13 +93,35 @@ export const addToList = async (req, res) => {
         const existingPapers = new Set(
             list.papers.map((p) => p._id.toString())
         );
-        const newPapers = paperIds.filter((id) => !existingPapers.has(id));
+        const newPapers = papers.filter(
+            (paper) => !existingPapers.has(paper._id.toString())
+        );
 
-        list.papers.push(...newPapers);
-        await list.save();
+        if (newPapers.length > 0) {
+            list.papers.push(...newPapers.map((p) => p._id));
+            list.updatedAt = new Date();
+            await list.save();
 
-        await logActivity(req.user.id, "added_to_reading_list", null);
-        res.json(await list.populate("papers", "title authors abstract"));
+            // Log activity with paper details
+            await logActivity(
+                req.user.id,
+                "added_to_reading_list",
+                null,
+                list._id,
+                {
+                    listName: list.name,
+                    addedPapers: newPapers.map((p) => ({
+                        id: p._id,
+                        title: p.title,
+                    })),
+                    totalPapers: list.papers.length,
+                }
+            );
+        }
+
+        // Populate and return the updated list
+        await list.populate("papers", "title authors abstract keywords");
+        res.json(list);
     } catch (error) {
         res.status(500).json({
             message: "Error adding papers to reading list",
@@ -107,22 +133,66 @@ export const addToList = async (req, res) => {
 // Remove paper from reading list
 export const removeFromList = async (req, res) => {
     try {
-        const { listId, paperId } = req.params;
+        const { listId } = req.params;
+        const { paperIds } = req.body;
+
+        // Validate input
+        if (!Array.isArray(paperIds)) {
+            return res
+                .status(400)
+                .json({ message: "paperIds must be an array" });
+        }
 
         const list = await ReadingList.findOne({
             _id: listId,
-            user: req.user.id,
-        });
-        if (!list)
-            return res.status(404).json({ message: "Reading list not found" });
+            $or: [
+                { user: req.user.id },
+                {
+                    "collaborators.user": req.user.id,
+                    "collaborators.role": "editor",
+                },
+            ],
+        }).populate("papers", "title");
 
-        list.papers = list.papers.filter((id) => id.toString() !== paperId);
-        list.paperNotes = list.paperNotes.filter(
-            (note) => note.paper.toString() !== paperId
+        if (!list) {
+            return res.status(404).json({ message: "Reading list not found" });
+        }
+
+        // Get paper details before removal for activity logging
+        const papersToRemove = list.papers.filter((paper) =>
+            paperIds.includes(paper._id.toString())
         );
 
-        await list.save();
-        await logActivity(req.user.id, "removed_from_reading_list", paperId);
+        if (papersToRemove.length > 0) {
+            // Remove papers and their notes
+            list.papers = list.papers.filter(
+                (paper) => !paperIds.includes(paper._id.toString())
+            );
+            list.paperNotes = list.paperNotes.filter(
+                (note) => !paperIds.includes(note.paper.toString())
+            );
+            list.updatedAt = new Date();
+            await list.save();
+
+            // Log activity with details
+            await logActivity(
+                req.user.id,
+                "removed_from_reading_list",
+                null,
+                list._id,
+                {
+                    listName: list.name,
+                    removedPapers: papersToRemove.map((p) => ({
+                        id: p._id,
+                        title: p.title,
+                    })),
+                    remainingPapers: list.papers.length,
+                }
+            );
+        }
+
+        // Populate and return the updated list
+        await list.populate("papers", "title authors abstract keywords");
         res.json(list);
     } catch (error) {
         res.status(500).json({

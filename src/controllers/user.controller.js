@@ -245,3 +245,96 @@ export const resetPassword = asyncHandler(async (req, res) => {
     // Verify token and expiry, then update password
     // Invalidate previous refreshToken, optionally force logout
 });
+
+export const getSettings = asyncHandler(async (req, res) => {
+    const user = await User.findById(req.user._id).select("settings");
+    return res
+        .status(200)
+        .json(
+            new ApiResponse(
+                200,
+                user.settings,
+                "User settings retrieved successfully"
+            )
+        );
+});
+
+export const updateSettings = asyncHandler(async (req, res) => {
+    const { settings } = req.body;
+
+    if (!settings || typeof settings !== "object") {
+        throw new ApiError(400, "Invalid settings object");
+    }
+
+    const user = await User.findById(req.user._id);
+
+    // Deep merge existing settings with new settings
+    const currentSettings = user.settings ? user.settings.toObject() : {};
+    const emailNotifications = currentSettings.emailNotifications || {};
+    const defaultChatOptions = currentSettings.defaultChatOptions || {};
+    const displayPreferences = currentSettings.displayPreferences || {};
+
+    user.settings = {
+        ...currentSettings,
+        ...settings,
+        emailNotifications: {
+            ...emailNotifications,
+            ...(settings.emailNotifications || {}),
+        },
+        defaultChatOptions: {
+            ...defaultChatOptions,
+            ...(settings.defaultChatOptions || {}),
+        },
+        displayPreferences: {
+            ...displayPreferences,
+            ...(settings.displayPreferences || {}),
+        },
+    };
+
+    await user.save({ validateBeforeSave: false });
+
+    return res
+        .status(200)
+        .json(
+            new ApiResponse(
+                200,
+                user.settings,
+                "User settings updated successfully"
+            )
+        );
+});
+
+export const updateProfile = asyncHandler(async (req, res) => {
+    const {
+        name,
+        bio,
+        institution,
+        title,
+        socialLinks,
+        researchInterests,
+        profilePicture,
+    } = req.body;
+
+    const updateFields = {};
+    if (name) updateFields.name = name;
+    if (bio) updateFields.bio = bio;
+    if (institution) updateFields.institution = institution;
+    if (title) updateFields.title = title;
+    if (socialLinks) updateFields.socialLinks = socialLinks;
+    if (researchInterests) updateFields.researchInterests = researchInterests;
+    if (profilePicture) updateFields.profilePicture = profilePicture;
+
+    const user = await User.findByIdAndUpdate(
+        req.user._id,
+        { $set: updateFields },
+        { new: true }
+    ).select("-password -refreshToken");
+
+    if (!user) {
+        throw new ApiError(404, "User not found");
+    }
+
+    return res
+        .status(200)
+        .json(new ApiResponse(200, user, "Profile updated successfully"));
+});

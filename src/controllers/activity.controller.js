@@ -13,31 +13,48 @@ export const logActivity = async (
     importance = "medium"
 ) => {
     try {
-        const activityData = {
-            user: userId,
-            action,
-            details,
-            importance,
-        };
-
         if (!userId || !action) {
             console.error("Invalid activity log attempt");
             return;
         }
+
+        // Prepare activity data
+        const activityData = {
+            user: userId,
+            action,
+            details: {
+                ...details,
+                timestamp: new Date().toISOString()
+            },
+            importance,
+            createdAt: new Date()
+        };
+
+        // Add references if provided
         if (paperId) activityData.paper = paperId;
         if (readingListId) activityData.readingList = readingListId;
 
-        await Activity.create(activityData);
+        // Create activity with metadata
+        const activity = await Activity.create(activityData);
 
-        // Update user's activity statistics
+        // Update related documents
         if (action === "uploaded_paper") {
             await User.findByIdAndUpdate(userId, {
                 $inc: { "usage.currentMonthUploads": 1 },
+                $set: { "lastActivity.uploadPaper": new Date() }
             });
         } else if (action === "started_chat") {
             await User.findByIdAndUpdate(userId, {
                 $inc: { "usage.totalChats": 1 },
+                $set: { "lastActivity.chat": new Date() }
             });
+        } else if (action.includes("reading_list")) {
+            // Update reading list last activity
+            if (readingListId) {
+                await ReadingList.findByIdAndUpdate(readingListId, {
+                    $set: { lastActivity: new Date() }
+                });
+            }
         }
     } catch (error) {
         console.error("Error logging activity:", error);
@@ -47,14 +64,40 @@ export const logActivity = async (
 // Get user's activity feed
 export const getActivity = async (req, res) => {
     try {
-        const { limit = 50, skip = 0, paper, action, importance } = req.query;
+        const { 
+            limit = 50, 
+            skip = 0, 
+            paper, 
+            action, 
+            importance,
+            startDate,
+            endDate,
+            type 
+        } = req.query;
 
         // Build query based on filters
         const query = { user: req.user.id };
 
+        // Basic filters
         if (paper) query.paper = paper;
         if (action) query.action = action;
         if (importance) query.importance = importance;
+
+        // Date range filter
+        if (startDate || endDate) {
+            query.createdAt = {};
+            if (startDate) query.createdAt.$gte = new Date(startDate);
+            if (endDate) query.createdAt.$lte = new Date(endDate);
+        }
+
+        // Activity type filter
+        if (type) {
+            if (type === 'reading_list') {
+                query.action = { $regex: /reading_list$/ };
+            } else if (type === 'paper') {
+                query.action = { $regex: /paper$/ };
+            }
+        }
 
         const feed = await Activity.find(query)
             .sort({ createdAt: -1 })
@@ -62,10 +105,20 @@ export const getActivity = async (req, res) => {
             .limit(parseInt(limit))
             .populate({
                 path: "paper",
-                select: "title authors",
-                match: { user: req.user.id }, // Ensure only user's papers
+                select: "title authors metadata",
+                match: { user: req.user.id }
             })
-            .populate("readingList", "name")
+            .populate({
+                path: "readingList",
+                select: "name isPublic papers",
+                match: { 
+                    $or: [
+                        { user: req.user.id },
+                        { isPublic: true },
+                        { "collaborators.user": req.user.id }
+                    ]
+                }
+            })
             .lean();
 
         // Get total count for pagination

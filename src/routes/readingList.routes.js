@@ -23,7 +23,7 @@ router.delete("/:id", deleteList);
 
 // Managing papers in reading lists
 router.post("/add", addToList);
-router.delete("/:listId/papers/:paperId", removeFromList);
+router.delete("/:listId/papers", removeFromList);
 
 // Public lists
 router.get("/public", getPublicLists);

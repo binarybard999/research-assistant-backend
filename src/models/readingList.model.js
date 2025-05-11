@@ -6,9 +6,20 @@ const ReadingListSchema = new mongoose.Schema(
             type: mongoose.Schema.Types.ObjectId,
             ref: "User",
             required: true,
+            index: true
         },
-        name: { type: String, required: true },
-        description: { type: String, default: "" },
+        name: { 
+            type: String, 
+            required: true,
+            trim: true,
+            maxLength: 100
+        },
+        description: { 
+            type: String, 
+            default: "",
+            trim: true,
+            maxLength: 500
+        },
         papers: [
             {
                 type: mongoose.Schema.Types.ObjectId,
@@ -22,7 +33,11 @@ const ReadingListSchema = new mongoose.Schema(
             },
         ],
         isPublic: { type: Boolean, default: false },
-        tags: [String],
+        tags: [{ 
+            type: String,
+            trim: true,
+            maxLength: 50
+        }],
         collaborators: [
             {
                 user: {
@@ -32,8 +47,7 @@ const ReadingListSchema = new mongoose.Schema(
                         validator: async function (v) {
                             return await User.exists({ _id: v });
                         },
-                        message: (props) =>
-                            `User ${props.value} does not exist`,
+                        message: (props) => `User ${props.value} does not exist`,
                     },
                 },
                 role: {
@@ -41,8 +55,31 @@ const ReadingListSchema = new mongoose.Schema(
                     enum: ["viewer", "editor"],
                     default: "viewer",
                 },
+                addedAt: { 
+                    type: Date, 
+                    default: Date.now 
+                }
             },
         ],
+        // Added fields for better tracking
+        paperCount: { 
+            type: Number, 
+            default: 0,
+            min: 0
+        },
+        lastActivity: { 
+            type: Date,
+            default: Date.now
+        },
+        lastPaperAddedAt: {
+            type: Date,
+            default: Date.now
+        },
+        views: {
+            type: Number,
+            default: 0,
+            min: 0
+        },
         paperNotes: [
             {
                 paper: { type: mongoose.Schema.Types.ObjectId, ref: "Paper" },
@@ -54,17 +91,32 @@ const ReadingListSchema = new mongoose.Schema(
     { timestamps: true }
 );
 
-// Add pre-save hook for duplicate prevention
+// Middleware to handle paper operations and maintain list integrity
 ReadingListSchema.pre("save", function (next) {
-    // Remove duplicate papers
-    this.papers = [...new Set(this.papers.map((p) => p.toString()))];
+    const currentDate = new Date();
+
+    // Set updatedAt for the list
+    this.updatedAt = currentDate;
+
+    // Remove duplicate papers while preserving order
+    const seen = new Set();
+    this.papers = this.papers.filter(p => {
+        const paperId = p.toString();
+        return seen.has(paperId) ? false : seen.add(paperId);
+    });
 
     // Remove duplicate collaborators
-    const seen = new Set();
+    const seenCollabs = new Set();
     this.collaborators = this.collaborators.filter((c) => {
         const key = c.user.toString();
-        return seen.has(key) ? false : seen.add(key);
+        return seenCollabs.has(key) ? false : seenCollabs.add(key);
     });
+
+    // Update metadata
+    this.paperCount = this.papers.length;
+    if (this.isModified('papers')) {
+        this.lastPaperAddedAt = currentDate;
+    }
 
     next();
 });

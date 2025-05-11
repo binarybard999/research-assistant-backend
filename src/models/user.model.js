@@ -8,6 +8,25 @@ const UserSchema = new mongoose.Schema(
         email: { type: String, required: true, unique: true },
         password: { type: String, required: true },
         refreshToken: { type: String },
+        profilePicture: {
+            type: String,
+            default: function () {
+                const encodedName = encodeURIComponent(this.name || "User");
+                return `https://ui-avatars.com/api/?name=${encodedName}&background=0D8ABC&color=fff&bold=true&size=128`;
+            },
+        },
+
+        bio: { type: String, maxLength: 500 },
+        institution: { type: String },
+        title: { type: String },
+        socialLinks: {
+            googleScholar: { type: String },
+            researchGate: { type: String },
+            orcid: { type: String },
+            twitter: { type: String },
+            linkedin: { type: String },
+        },
+        researchInterests: [{ type: String }],
         tier: {
             type: String,
             enum: ["free", "pro", "enterprise"],
@@ -20,6 +39,26 @@ const UserSchema = new mongoose.Schema(
         usage: {
             currentMonthUploads: { type: Number, default: 0 },
             totalChats: { type: Number, default: 0 },
+        },
+        settings: {
+            theme: {
+                type: String,
+                enum: ["light", "dark", "system"],
+                default: "system",
+            },
+            emailNotifications: {
+                paperUploads: { type: Boolean, default: true },
+                recommendations: { type: Boolean, default: true },
+                paperSummaries: { type: Boolean, default: true },
+            },
+            defaultChatOptions: {
+                includeContext: { type: Boolean, default: true },
+                followupQuestions: { type: Boolean, default: true },
+            },
+            displayPreferences: {
+                papersPerPage: { type: Number, default: 10 },
+                listView: { type: Boolean, default: false }, // false = grid view
+            },
         },
     },
     { timestamps: true }
